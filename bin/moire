@@ -1937,29 +1937,38 @@ def cmd_init_swarm(git, argv):
     # 4. Skills --------------------------------------------------------
     step("== skills ==")
     script_dir = os.path.dirname(os.path.realpath(__file__))
-    src_skills = os.path.normpath(os.path.join(script_dir, "..", "skills", "moire"))
+    skills_root = os.path.normpath(os.path.join(script_dir, "..", "skills"))
+    # Every directory under skills/ that holds a SKILL.md, so a new skill is picked
+    # up without touching this code.
+    src_skills = []
+    if os.path.isdir(skills_root):
+        for name in sorted(os.listdir(skills_root)):
+            d = os.path.join(skills_root, name)
+            if os.path.isfile(os.path.join(d, "SKILL.md")):
+                src_skills.append((name, d))
     if skills_mode == "none":
         step("  --skills none: skipping")
-    elif not os.path.isdir(src_skills):
+    elif not src_skills:
         # Installs from npm ship skills/; a bare checkout of just bin/moire may not.
-        step("  skills/moire/ not found next to %s: skipping" % script_dir)
+        step("  no skills/ found next to %s: skipping" % script_dir)
     else:
-        dests = []
         if skills_mode == "user":
             home = os.path.expanduser("~")
-            dests = [os.path.join(home, ".claude", "skills", "moire"),
-                     os.path.join(home, ".agents", "skills", "moire")]
+            roots = [os.path.join(home, ".claude", "skills"),
+                     os.path.join(home, ".agents", "skills")]
         else:  # project
-            dests = [os.path.join(top, ".claude", "skills", "moire")]
+            roots = [os.path.join(top, ".claude", "skills")]
             sys.stdout.write(
                 "  WARNING: --skills project writes into the working tree (%s) "
-                "- add it to .gitignore.\n" % dests[0])
-        for d in dests:
-            if dry_run:
-                step("  [dry-run] would copy %s -> %s" % (src_skills, d))
-            else:
-                shutil.copytree(src_skills, d, dirs_exist_ok=True)
-                step("  copied: %s" % d)
+                "- add it to .gitignore.\n" % roots[0])
+        for name, src in src_skills:
+            for root in roots:
+                d = os.path.join(root, name)
+                if dry_run:
+                    step("  [dry-run] would copy %s -> %s" % (src, d))
+                else:
+                    shutil.copytree(src, d, dirs_exist_ok=True)
+                    step("  copied: %s" % d)
 
     # 5. Doctor --------------------------------------------------------
     step("== doctor ==")

@@ -184,11 +184,19 @@ The `command` path is absolute and specific to your clone. Putting it in
 
 </details>
 
-**Optional but recommended:** copy `skills/moire/` into `.claude/skills/` (or
-`.agents/skills/`, which Codex CLI, Cursor and OpenCode also read). It teaches the
-agent how to read a finding and what the five actions mean. A warning an agent does
-not know how to act on is a warning it ignores — which is the failure mode that made
-ConE, above, a comment nobody measured.
+`init-swarm` also installs two Agent Skills (or copy `skills/` into `.claude/skills/`
+or `.agents/skills/` yourself):
+
+- **`moire`** — how to read a finding and which of the five actions applies. A warning
+  an agent does not know how to act on is a warning it ignores, which is the failure
+  mode that made ConE, above, a comment nobody measured.
+- **`moire-parallel`** — how to set up and run the swarm. With it installed, *"use
+  moire and parallelise this across three agents"* is enough; the skill covers
+  worktrees, dispatch, and the rule agents most often skip — run `moire verify` before
+  calling a task done, because a semantic break often only appears once both sides have
+  finished writing.
+
+Neither skill decides how to split the work. That judgement stays with you.
 
 ## Commands
 
@@ -250,7 +258,8 @@ Every suite verifies against independent ground truth and has been shown to fail
 ```
 bin/moire        the tool — a single file, Python 3.8, standard library only
 bin/moire.js     Node launcher, used only by the npm distribution
-skills/moire/    an Agent Skill teaching agents how to act on a finding
+skills/          two Agent Skills: one for acting on a finding, one for
+                 setting up parallel work
 tests/           54 tests across four suites
 package.json     npm packaging
 README.md        this file
