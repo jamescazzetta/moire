@@ -116,6 +116,18 @@ The tool is what survived that.
 
 **Requires git ≥ 2.38.** Older git silently misses whole classes of conflict (rename/rename, modify/delete, binary), so `moire` refuses to run rather than give you a detector with blind spots. macOS ships 2.30 — `brew install git`.
 
+Install it however you like — the tool is a single Python file, so cloning and
+pointing at `bin/moire` works just as well as the package:
+
+```bash
+npm install -g @jamescazzetta/moire     # puts `moire` on PATH
+# or just: git clone https://github.com/jamescazzetta/moire.git
+```
+
+The npm package is only a distribution wrapper; it adds a small Node launcher that
+locates a Python 3.8+ interpreter and gives a clear message if none is present. The
+tool itself has no dependencies of any kind.
+
 ```bash
 # one worktree per agent
 git worktree add ../repo-agent-a -b feat/a
@@ -221,8 +233,10 @@ Every suite verifies against independent ground truth and has been shown to fail
 
 ```
 bin/moire        the tool — a single file, Python 3.8, standard library only
+bin/moire.js     Node launcher, used only by the npm distribution
 skills/moire/    an Agent Skill teaching agents how to act on a finding
 tests/           40 tests across three suites
+package.json     npm packaging
 README.md        this file
 LICENSE          MIT
 ```
