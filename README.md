@@ -86,9 +86,18 @@ For **Claude Code**, add this to `~/.claude/settings.json` (or a per-worktree `.
 }
 ```
 
-Don't commit that file — the path is specific to your clone. Snippets for Codex CLI, Cursor and OpenCode come from `--print-client-hooks`.
+Two things to know about that snippet:
 
-`moire` never edits your client settings. It prints; you paste.
+- **The `command` path is absolute and specific to your clone.** Putting it in
+  `~/.claude/settings.json` keeps it out of the repository entirely, which is the
+  simplest option. If you prefer the in-repo `.claude/settings.local.json`, add that
+  file to your `.gitignore` — committed, it would point at a path that exists only on
+  your machine.
+- **`moire install --print-client-hooks` prints the same snippet for Codex CLI, Cursor
+  and OpenCode**, with the correct absolute path already filled in, so you can paste
+  rather than hand-edit.
+
+`moire` never writes to your client settings. It prints; you paste.
 
 ## Commands
 
