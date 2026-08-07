@@ -116,7 +116,8 @@ Three mechanisms were designed here and then abandoned on evidence:
   another, because it only *approximates* git's merge condition. Replaced by asking
   git directly.
 - **A symbol-matching heuristic** to catch the semantic case from diffs alone. Tested
-  against 2,347 real merges *before* implementation: 24 fires, **0 true positives** —
+  against 2,347 concurrent branch pairs *before* implementation: 24 fires, **0 true
+  positives** —
   every one a regex artifact, including English prose in a docstring matching a
   definition pattern. Killed before a line was written.
 
@@ -236,7 +237,12 @@ The default checker is a small Python import resolver with no dependencies. `--c
 
 **The mechanism works and is tested.** 54 tests across four suites, all passing, including a negative-control run proving the suite can actually fail.
 
-**Whether the problem is frequent enough to be worth solving is genuinely unknown.** In 2,347 real merges from six well-known open-source projects, the silent-semantic-breakage case that `moire verify` targets occurred **zero times**. Humans avoid it socially — issue claiming, standups, "I'm taking that module." AI agents dispatched in parallel have no such process, which is the whole premise of this tool. **That premise has never been measured.**
+**Whether the problem is frequent enough to be worth solving is genuinely unknown.** I
+went looking for this failure in real open-source history and did not find it — see
+[A note on the numbers](#a-note-on-the-numbers) for what that search did and did not
+cover. Humans appear to avoid it socially: issue claiming, standups, "I'm taking that
+module." Agents dispatched in parallel have no such process, which is the whole premise
+of this tool. **That premise has never been measured.**
 
 So this is a working instrument aimed at an open question, not a proven product. It is designed to answer its own question: point it at real concurrent agent work for a week and `moire report --study` gives you a base rate nobody has published.
 
@@ -274,12 +280,18 @@ configuration file and no runtime dependency beyond git.
 Every figure in this README is measured on this machine rather than estimated,
 and the method is short enough to restate:
 
-- **Conflict rates** come from replaying real merge history. Each merge commit on
-  trunk is treated as a branch with a fork point and a merge date; two branches
-  whose windows overlap were genuinely concurrent. Across flask, click, rich,
-  requests, pytest and httpx that yields 2,347 concurrent pairs which merged
-  cleanly — and zero instances of the silent semantic breakage `moire verify`
-  targets.
+- **Conflict rates** come from replaying real merge history. Each merge commit on trunk
+  is treated as a branch with a fork point and a merge date; two branches whose windows
+  overlap were genuinely concurrent. Across flask, click, rich, requests, pytest and
+  httpx that yields 2,347 concurrent pairs which would have merged cleanly. Most of
+  those merges never happened — they are synthesised pairwise, not merge commits that
+  occurred.
+- **The search for semantic breakage covered one failure mode, not all of them.**
+  Each merged tree was checked for cross-module references the combination broke — a
+  name one side removed while the other started using it. That found nothing. It does
+  **not** cover changed signatures with the same name, arity mismatches, or type errors,
+  so "not found" means "not found by an import check," not "does not happen." It is also
+  human history, not agent history, which is the whole open question.
 - **Latency** is a median over repeated runs on a small repository, reported warm
   and cold separately because caching dominates.
 - **The git ≥ 2.38 floor** comes from direct testing: the older three-argument
