@@ -12,9 +12,20 @@ Here's the shape of it:
 
 > **Agent A** renames `validate_session` to `validate_session_v2` in `auth.py`, and carefully updates every caller it can see. Correct work.
 >
-> **Agent B**, in a different file, adds a new function that calls `validate_session`. Also correct work.
+> **Agent B** adds a new file that calls `validate_session`. Also correct work — in B's
+> worktree, that function still exists.
 >
-> The two agents touched **completely different files**. Git merges them cleanly — no conflict markers, no warning. The program is broken.
+> A touched `auth.py` and its callers. B touched a file A never opened. Their file sets
+> are **disjoint**, so git merges them cleanly — no conflict markers, no warning. The
+> merged result calls a function that is no longer there.
+
+That last detail is what makes it slip through. Had B added the call *into* a file A
+also edited, git would have raised a conflict and someone would have looked. Disjoint
+edits get no such scrutiny — which is why there are two checks:
+
+- `moire check` catches the overlapping case **earlier than git would**, while both
+  agents are still writing.
+- `moire verify` catches the disjoint case, which nothing else does.
 
 Or, as a house:
 
