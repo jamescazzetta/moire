@@ -46,7 +46,7 @@ That second one is the case git merges cleanly. It took 38 ms to find.
 
 **1. It needs no cooperation.** It reads the other agent's files directly — it never asks them anything. The other agent doesn't need the tool installed, doesn't need to know it exists, and can be from an entirely different vendor. Protection accrues to whoever runs the check.
 
-This matters more than it sounds. The obvious design is to have agents *declare* what they're about to touch. That has been tried and measured, and it does not work: agents are unreliable narrators of their own scope. In a 360-run study of pre-write admission over declared intent ([arXiv:2608.00947](https://arxiv.org/abs/2608.00947)), the selective policy scored 22.2% against 23.3% for no coordination at all, failing closed on undeclared scope in 51% of runs. Watching beats asking.
+This matters more than it sounds. The obvious design is to have agents *declare* what they are about to touch. That has been tried, enforced, and measured — it does not work, for a reason no protocol can repair: an agent is an unreliable narrator of its own scope. The numbers are below. Watching beats asking.
 
 **2. It's exact, not a guess.** No heuristics, no thresholds, no model, no tuning. `moire check` uses git's own merge engine, so its answer is the answer the real merge will give. `moire verify` runs a real checker on a real tree. False positives are structurally impossible.
 
