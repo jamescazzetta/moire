@@ -248,16 +248,24 @@ The default checker is a small Python import resolver with no dependencies. `--c
 
 **The mechanism works and is tested.** 54 tests across four suites, all passing, including a negative-control run proving the suite can actually fail.
 
-**Whether the problem is frequent enough to be worth solving is genuinely unknown.** I
-went looking for this failure in real open-source history and did not find it — see
-[A note on the numbers](#a-note-on-the-numbers) for what that search did and did not
-cover. Humans appear to avoid it socially: issue claiming, standups, "I'm taking that
-module." Agents dispatched in parallel have no such process, which is the whole premise
-of this tool. **That premise has never been measured.**
+**What is unknown is the frequency, not the existence.** The failure is real and easy to
+reproduce — `tests/` contains a fixture for it. What nobody has published, as far as I
+can find, is how *often* two concurrent agents produce a clean merge that doesn't work.
+That number is what decides whether this is worth ~187 ms on every write.
 
-So this is a working instrument aimed at an open question, not a proven product. It is designed to answer its own question: point it at real concurrent agent work for a week and `moire report --study` gives you a base rate nobody has published.
+A search of human open-source history turned up little, but that says less than it
+sounds like: it covered one failure mode (cross-module references, not changed
+signatures or arity mismatches) on the wrong population. Human teams also coordinate
+socially — issue claiming, standups, "I'm taking that module" — which agents dispatched
+in parallel do not. See [A note on the numbers](#a-note-on-the-numbers).
 
-The kill criterion, stated before the data arrives: **if semantic breakage stays at zero on real agent traffic, `moire verify` should be deleted** — leaving textual detection, which stands on its own.
+So this is a working instrument aimed at an open quantity, not a proven product. It is
+built to answer its own question: point it at real concurrent agent work for a week and
+`moire report --study` gives you a base rate.
+
+The kill criterion, stated before the data arrives: **if the rate on real agent traffic
+is too low to justify the cost, `moire verify` should be deleted** — leaving textual
+detection, which stands on its own.
 
 ## Tests
 
