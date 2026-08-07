@@ -16,6 +16,15 @@ const fs = require('fs');
 
 const script = path.join(__dirname, 'moire');
 
+// Windows is untested: the tool uses POSIX paths and the suites are bash. This
+// warns rather than blocking, so anyone who wants to try it can. The check runs
+// on every file write via a hook, so it must be silenceable.
+if (process.platform === 'win32' && !process.env.MOIRE_NO_PLATFORM_WARN) {
+  process.stderr.write(
+    'moire: Windows is untested — POSIX paths and bash test suites are assumed.\n' +
+    '    WSL is the supported route. Set MOIRE_NO_PLATFORM_WARN=1 to silence this.\n');
+}
+
 if (!fs.existsSync(script)) {
   process.stderr.write('moire: missing ' + script + '\n');
   process.exit(2);

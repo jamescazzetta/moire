@@ -37,10 +37,6 @@
   "engines": {
     "node": ">=14"
   },
-  "os": [
-    "darwin",
-    "linux"
-  ],
   "scripts": {
     "test": "bash tests/test_oracle.sh && bash tests/test_install.sh && bash tests/test_study.sh"
   },

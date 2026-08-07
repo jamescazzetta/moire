@@ -13,13 +13,7 @@ __pycache__/
 .codex/hooks.json
 
 # Working research, design history and review material — kept locally, not published.
-/BRIEF-FOR-REVIEW.md
-/design-premise.md
-/designs/
-/spec/
 /research/
-/scope-ledger-spec.md
-/swarm-coordination-architecture.md
 
 # npm
 node_modules/
