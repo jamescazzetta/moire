@@ -42,15 +42,25 @@ BROKEN with /repo-agent-b (1 new breakage, merged tree d6d2141b)
 
 That second one is the case git merges cleanly. It took 38 ms to find.
 
+```bash
+git clone https://github.com/jamescazzetta/moire.git
+moire init-swarm --agents 3                     # worktrees, hooks, skills, verify
+moire wire-client claude --scope user --apply   # shows a diff first
+```
+
+Needs **git ≥ 2.38** and **Python 3.8+**. No daemon, no server, no config file, no
+account, and nothing written into your working tree. Uninstalling is deleting a
+directory.
+
 ## Three things that make it unusual
 
-**1. It needs no cooperation.** It reads the other agent's files directly — it never asks them anything. The other agent doesn't need the tool installed, doesn't need to know it exists, and can be from an entirely different vendor. Protection accrues to whoever runs the check.
+- **It asks nobody anything.** It reads the other agent's files. The other agent needs
+  no setup, no awareness of the tool, and may be from a different vendor.
+- **It is exact, not a guess.** No heuristics, thresholds, model or tuning — `check`
+  runs git's own merge engine, `verify` runs a real checker on a real tree.
+- **It never blocks.** Warn-only by design, with no block mode and no flag to add one.
 
-This matters more than it sounds. The obvious design is to have agents *declare* what they are about to touch. That has been tried, enforced, and measured — it does not work, for a reason no protocol can repair: an agent is an unreliable narrator of its own scope. The numbers are below. Watching beats asking.
-
-**2. It's exact, not a guess.** No heuristics, no thresholds, no model, no tuning. `moire check` uses git's own merge engine, so its answer is the answer the real merge will give. `moire verify` runs a real checker on a real tree. False positives are structurally impossible.
-
-**3. It never blocks.** Warn-only, by design — there is no block mode and no flag to add one. Blocking is a decision that needs evidence nobody has yet.
+Each of those is a reaction to something that has already been tried and measured.
 
 ## What has been tried before
 
@@ -114,19 +124,9 @@ The tool is what survived that.
 
 ## Install
 
-**Requires git ≥ 2.38.** Older git silently misses whole classes of conflict (rename/rename, modify/delete, binary), so `moire` refuses to run rather than give you a detector with blind spots. macOS ships 2.30 — `brew install git`.
-
-Install it however you like — the tool is a single Python file, so cloning and
-pointing at `bin/moire` works just as well as the package:
-
-```bash
-npm install -g @jamescazzetta/moire     # puts `moire` on PATH
-# or just: git clone https://github.com/jamescazzetta/moire.git
-```
-
-The npm package is only a distribution wrapper; it adds a small Node launcher that
-locates a Python 3.8+ interpreter and gives a clear message if none is present. The
-tool itself has no dependencies of any kind.
+**Requires git ≥ 2.38.** Older git silently misses whole classes of conflict
+(rename/rename, modify/delete, binary), so `moire` refuses to run rather than give you
+a detector with blind spots. Stock macOS ships 2.30 — `brew install git`.
 
 ```bash
 # create N worktrees, install the binary and git hooks, place the skill, verify
