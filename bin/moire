@@ -1,0 +1,1887 @@
+#!/usr/bin/env python3
+"""moire - observed-diff conflict detection between concurrent git worktrees.
+
+Answers one question: right now, would my worktree and each peer worktree conflict
+if both landed? Uses `git merge-tree --write-tree` as an exact oracle.
+
+Load-bearing facts:
+  - git >= 2.38 REQUIRED. Legacy 3-arg merge-tree gives false negatives on
+    rename/rename, modify/delete and binary-both-sides. We refuse rather than degrade.
+  - Verdict comes from the EXIT CODE, never from grepping output for conflict
+    markers (file content can contain them).
+  - Warn-only. There is no block mode and no flag to add one.
+  - Observation never mutates the observed worktree: we copy its index and work
+    through GIT_INDEX_FILE, so even a held index.lock does not stop us.
+
+Note: snapshot trees/commits are written into the repo's own object store. They are
+refless and reclaimed by `git gc`. No alternates scheme by design (phase 0 simplicity).
+
+Python 3.8 compatible, stdlib only.
+"""
+
+import ast
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from datetime import datetime
+
+MIN_GIT = (2, 38)
+SNAPSHOT_ENV = {
+    "GIT_AUTHOR_NAME": "moire", "GIT_AUTHOR_EMAIL": "moire@localhost",
+    "GIT_COMMITTER_NAME": "moire", "GIT_COMMITTER_EMAIL": "moire@localhost",
+}
+HOOK_MARKER = "# >>> moire hook >>>"
+HOOKS = ("post-commit", "post-merge")
+DEFAULT_CACHE_TTL = 2.0
+NOTE_MAX_CHARS = 200
+
+
+# ---------------------------------------------------------------- git plumbing
+
+def _run(args, cwd=None, env=None, check=False):
+    e = dict(os.environ)
+    if env:
+        e.update(env)
+    p = subprocess.run(args, cwd=cwd, env=e, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+    out = p.stdout.decode("utf-8", "replace")
+    err = p.stderr.decode("utf-8", "replace")
+    if check and p.returncode != 0:
+        raise RuntimeError("%s failed (%d): %s" % (" ".join(args[:3]), p.returncode, err.strip()))
+    return p.returncode, out, err
+
+
+def _parse_version(s):
+    parts = s.split()
+    for tok in parts:
+        bits = tok.split(".")
+        if len(bits) >= 2 and bits[0].isdigit() and bits[1].isdigit():
+            return (int(bits[0]), int(bits[1]))
+    return (0, 0)
+
+
+def find_git():
+    """Return (path, (major,minor)) for a git >= MIN_GIT, or (path, ver) of the best found.
+
+    MOIRE_GIT is EXCLUSIVE: if the caller names a git explicitly we use exactly that one,
+    even when it is too old. Falling back to a newer git on PATH would silently defeat
+    `MOIRE_GIT=/usr/bin/git moire check`, which must refuse.
+    """
+    forced = os.environ.get("MOIRE_GIT")
+    if forced:
+        if not os.path.exists(forced):
+            return None, (0, 0)
+        rc, out, _ = _run([forced, "--version"])
+        return (forced, _parse_version(out)) if rc == 0 else (None, (0, 0))
+    cands = ["/opt/homebrew/bin/git"]
+    w = shutil.which("git")
+    if w:
+        cands.append(w)
+    cands.append("/usr/bin/git")
+    best = (None, (0, 0))
+    for c in cands:
+        if not c or not os.path.exists(c):
+            continue
+        rc, out, _ = _run([c, "--version"])
+        if rc != 0:
+            continue
+        v = _parse_version(out)
+        if v >= MIN_GIT:
+            return c, v
+        if v > best[1]:
+            best = (c, v)
+    return best
+
+
+class Git(object):
+    def __init__(self, path, version):
+        self.path = path
+        self.version = version
+
+    def __call__(self, args, cwd=None, env=None, check=False):
+        return _run([self.path] + args, cwd=cwd, env=env, check=check)
+
+    def out(self, args, cwd=None, env=None):
+        rc, o, e = self(args, cwd=cwd, env=env)
+        return o.strip() if rc == 0 else None
+
+    @property
+    def version_str(self):
+        return "%d.%d" % self.version
+
+
+def common_dir(git, cwd):
+    """Absolute realpath of $GIT_COMMON_DIR.
+
+    `git rev-parse --git-common-dir` yields a path relative to the CWD in the main
+    worktree and an absolute one from a linked worktree; --path-format=absolute does
+    not exist before git 2.31. Normalise both to the same absolute realpath.
+    """
+    p = git.out(["rev-parse", "--git-common-dir"], cwd=cwd)
+    if p is None:
+        return None
+    if not os.path.isabs(p):
+        p = os.path.join(cwd, p)
+    return os.path.realpath(p)
+
+
+def state_dir(cd):
+    return os.path.join(cd, "moire")
+
+
+def log_dir(cd):
+    return os.path.join(state_dir(cd), "log")
+
+
+def cache_dir(cd):
+    return os.path.join(state_dir(cd), "cache")
+
+
+def notes_dir(cd):
+    return os.path.join(state_dir(cd), "notes")
+
+
+def installed_bin(cd):
+    return os.path.join(state_dir(cd), "bin", "moire")
+
+
+def list_worktrees(git, cwd):
+    """-> [{'worktree','head','branch'}] from `git worktree list --porcelain`."""
+    rc, out, _ = git(["worktree", "list", "--porcelain"], cwd=cwd)
+    if rc != 0:
+        return []
+    res, cur = [], {}
+    for line in out.split("\n"):
+        line = line.rstrip()
+        if not line:
+            if cur.get("worktree"):
+                res.append(cur)
+            cur = {}
+            continue
+        if line.startswith("worktree "):
+            cur = {"worktree": os.path.realpath(line[9:]), "head": None, "branch": None}
+        elif line.startswith("HEAD "):
+            cur["head"] = line[5:]
+        elif line.startswith("branch "):
+            b = line[7:]
+            cur["branch"] = b[11:] if b.startswith("refs/heads/") else b
+        elif line == "detached":
+            cur["branch"] = None
+    if cur.get("worktree"):
+        res.append(cur)
+    return res
+
+
+def _index_path(git, wt):
+    """-> absolute path to `wt`'s real index file (may not exist yet)."""
+    idx = git.out(["rev-parse", "--git-path", "index"], cwd=wt)
+    if idx and not os.path.isabs(idx):
+        idx = os.path.join(wt, idx)
+    return idx
+
+
+def _index_fingerprint(git, wt):
+    """-> (mtime, size) of `wt`'s real index file, or (None, None) if it has none yet.
+
+    Read-only `os.stat` on the real index - never opened for writing, so this
+    cannot be the mutation snapshot()'s copy-the-index dance exists to avoid.
+    """
+    idx = _index_path(git, wt)
+    if idx and os.path.exists(idx):
+        st = os.stat(idx)
+        return st.st_mtime, st.st_size
+    return None, None
+
+
+def snapshot(git, wt):
+    """Snapshot a worktree (HEAD + staged + unstaged + untracked) -> commit oid.
+
+    Works through a COPY of the worktree's index so the observed worktree is never
+    mutated and a held index.lock in it does not block us.
+    """
+    idx = _index_path(git, wt)
+    tmp = tempfile.NamedTemporaryFile(prefix="moire-index-", delete=False)
+    tmp.close()
+    tmpidx = tmp.name
+    try:
+        if idx and os.path.exists(idx):
+            shutil.copyfile(idx, tmpidx)
+        else:
+            os.unlink(tmpidx)
+        env = {"GIT_INDEX_FILE": tmpidx}
+        env.update(SNAPSHOT_ENV)
+        git(["add", "-A"], cwd=wt, env=env)
+        tree = git.out(["write-tree"], cwd=wt, env=env)
+        if not tree:
+            raise RuntimeError("write-tree produced no output for %s" % wt)
+        head = git.out(["rev-parse", "HEAD"], cwd=wt)
+        args = ["commit-tree", tree]
+        if head:
+            args += ["-p", head]
+        args += ["-m", "moire snapshot"]
+        commit = git.out(args, cwd=wt, env=env)
+        if not commit:
+            raise RuntimeError("commit-tree failed for %s" % wt)
+        return tree, commit
+    finally:
+        if os.path.exists(tmpidx):
+            os.unlink(tmpidx)
+
+
+# --------------------------------------------------------------- snapshot cache
+#
+# A worktree snapshot (copy index -> add -A -> write-tree -> commit-tree) is
+# ~43ms, the dominant cost of `moire check` (~43 + 55N ms for N peers). Self MUST
+# be recomputed every time -- the agent invoking us just wrote, so a stale
+# self-snapshot is the one error that silently produces a wrong verdict. A
+# PEER's snapshot may be reused across processes/invocations because nothing
+# about it changed since it was last observed: same HEAD, same index file
+# (mtime+size), and not older than MOIRE_CACHE_TTL. Working-tree edits (a plain
+# `Write` with no `git add`) touch neither HEAD nor the index, so a peer's
+# uncommitted edits can be up to TTL stale in a cache hit -- acceptable for an
+# advisory, warn-only signal, not acceptable for the self side, which is why
+# self never consults this cache at all.
+
+def cache_ttl():
+    v = os.environ.get("MOIRE_CACHE_TTL")
+    if v:
+        try:
+            return float(v)
+        except ValueError:
+            pass
+    return DEFAULT_CACHE_TTL
+
+
+def _cache_file(cd, worktree):
+    h = hashlib.sha1(worktree.encode("utf-8")).hexdigest()
+    return os.path.join(cache_dir(cd), h + ".json")
+
+
+def read_snapshot_cache(cd, worktree):
+    """-> the cached record dict for `worktree`, or None (missing/unparsable)."""
+    try:
+        with open(_cache_file(cd, worktree)) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_snapshot_cache(cd, worktree, tree, commit, head, idx_mtime, idx_size):
+    """Temp-file + os.rename, same pattern as the log shards: a reader never
+    observes a partially-written cache file."""
+    try:
+        os.makedirs(cache_dir(cd))
+    except OSError:
+        pass
+    rec = {"worktree": worktree, "tree": tree, "commit": commit, "head": head,
+           "index_mtime": idx_mtime, "index_size": idx_size, "cached_at": time.time()}
+    path = _cache_file(cd, worktree)
+    tmp = "%s.tmp-%d-%s" % (path, os.getpid(), uuid.uuid4().hex[:6])
+    try:
+        with open(tmp, "w") as f:
+            json.dump(rec, f)
+        os.rename(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def snapshot_peer_cached(git, wt, cd, head):
+    """Snapshot a PEER worktree, reusing a cached (tree, commit) when safe.
+
+    -> (tree, commit, was_cached). Never call this for self - see the module
+    note above. A hit requires the cached worktree, HEAD, and index
+    mtime+size to all match the current observed state, and `cached_at` to be
+    within MOIRE_CACHE_TTL. Any mismatch, missing cache, or parse failure falls
+    through to a real snapshot() call, whose result is then written back so
+    the NEXT observer (which may be a different moire process entirely, e.g.
+    another agent's own `moire check` treating this worktree as a peer) gets a
+    hit too.
+    """
+    idx_mtime, idx_size = _index_fingerprint(git, wt)
+    cached = read_snapshot_cache(cd, wt) if cd else None
+    if (cached and cached.get("worktree") == wt and cached.get("tree") and cached.get("commit")
+            and cached.get("head") == head
+            and cached.get("index_mtime") == idx_mtime and cached.get("index_size") == idx_size
+            and (time.time() - float(cached.get("cached_at", 0))) <= cache_ttl()):
+        return cached["tree"], cached["commit"], True
+    tree, commit = snapshot(git, wt)
+    if cd:
+        write_snapshot_cache(cd, wt, tree, commit, head, idx_mtime, idx_size)
+    return tree, commit, False
+
+
+def oracle(git, cwd, commit_a, commit_b):
+    """-> ('clean'|'conflict', [paths]).  Verdict from EXIT CODE, never marker grep.
+
+    Run with cwd = the acting worktree: merge-tree resolves .gitattributes (merge
+    drivers) from the checkout it runs in.
+    """
+    rc, out, err = git(["merge-tree", "--write-tree", "--name-only", commit_a, commit_b], cwd=cwd)
+    if rc == 0:
+        return "clean", []
+    if rc == 1:
+        lines = out.split("\n")
+        paths = []
+        for ln in lines[1:]:          # line 0 is the merged tree OID
+            if ln.strip() == "":
+                break                 # blank line ends the conflicted-file section
+            paths.append(ln.strip())
+        return "conflict", paths
+    raise RuntimeError("merge-tree failed (%d): %s" % (rc, (err or out).strip()))
+
+
+def oracle_tree(git, cwd, commit_a, commit_b):
+    """-> ('clean'|'conflict', [paths], merged_tree_oid).  Sibling of oracle().
+
+    `git merge-tree --write-tree --name-only` prints the merged tree's OID as
+    stdout line 0 on BOTH a clean merge (exit 0) and a conflicted one (exit 1) --
+    on conflict the tree is written anyway with conflict markers baked in, which
+    is not a tree `verify` ever reads. Verdict still comes from the EXIT CODE
+    only, exactly like oracle(); this function only adds the OID oracle() drops.
+    """
+    rc, out, err = git(["merge-tree", "--write-tree", "--name-only", commit_a, commit_b], cwd=cwd)
+    lines = out.split("\n")
+    tree = lines[0].strip() if lines and lines[0].strip() else None
+    if rc == 0:
+        return "clean", [], tree
+    if rc == 1:
+        paths = []
+        for ln in lines[1:]:          # line 0 is the merged tree OID
+            if ln.strip() == "":
+                break                 # blank line ends the conflicted-file section
+            paths.append(ln.strip())
+        return "conflict", paths, tree
+    raise RuntimeError("merge-tree failed (%d): %s" % (rc, (err or out).strip()))
+
+
+def materialize_tree(git, cwd, tree_oid, dest):
+    """Materialise a tree object into an empty directory: `git archive | tar -x`.
+
+    No worktree is created, no index or HEAD is touched anywhere; `cwd` merely
+    needs to be some path inside the repo so `git archive` can find the object
+    store (it does not read the checkout at `cwd`). `dest` must already exist.
+    """
+    p1 = subprocess.Popen([git.path, "-C", cwd, "archive", tree_oid],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p2 = subprocess.Popen(["tar", "-x", "-C", dest],
+                          stdin=p1.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    p1.stdout.close()                 # let p1 see SIGPIPE if p2 exits early
+    _out2, err2 = p2.communicate()
+    _out1, err1 = p1.communicate()
+    if p1.returncode != 0:
+        raise RuntimeError("git archive %s failed: %s" %
+                           (tree_oid, err1.decode("utf-8", "replace").strip()))
+    if p2.returncode != 0:
+        raise RuntimeError("tar extract of %s failed: %s" %
+                           (tree_oid, err2.decode("utf-8", "replace").strip()))
+
+
+# ------------------------------------------------------ builtin semantic checker
+#
+# Cross-module import resolver over stdlib `ast`. For every `from M import N`
+# and `import M.N` where module M resolves INSIDE the materialised tree, assert
+# N is defined, imported, or re-exported by M. Third-party/stdlib imports are
+# never considered: M can only "resolve inside the tree" if some file in the
+# tree maps to that dotted name, which is structurally impossible for e.g.
+# `os` or `numpy`. This is exact, not a heuristic: an unparsable file, a `*`
+# import, or a module absent from the tree all cause us to withhold judgement
+# (return "resolves fine") rather than guess - zero false positives by
+# construction, at the cost of only catching what ast can see.
+
+_BK_SKIP_DIRS = (".git", "node_modules", ".tox", "build", "dist")
+
+
+def _module_map(root):
+    """-> {dotted module name -> file path} for every .py file under root.
+
+    Indexed under every dotted suffix (src/pkg/mod.py -> "src.pkg.mod",
+    "pkg.mod", "mod") so a `from pkg import mod` resolves regardless of
+    where in the tree "pkg" sits relative to any assumed source root.
+    """
+    m = {}
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d not in _BK_SKIP_DIRS]
+        for f in fn:
+            if not f.endswith(".py"):
+                continue
+            full = os.path.join(dp, f)
+            rel = os.path.relpath(full, root)
+            parts = rel[:-3].split(os.sep)
+            if parts[-1] == "__init__":
+                parts = parts[:-1]
+            if not parts:
+                continue
+            for i in range(len(parts)):
+                m.setdefault(".".join(parts[i:]), full)
+    return m
+
+
+def _toplevel_names(path, cache):
+    """-> (names, has_star_import) for the top level of `path`, memoised in `cache`.
+
+    `names` covers defs, classes, plain/annotated assignments, and anything
+    brought into scope by import/import-from - i.e. defined, imported, or
+    re-exported. A top-level `if`/`try` is additionally flattened with a full
+    `ast.walk` (conditional defs, try/except import fallbacks are idiomatic
+    Python) so nothing nested inside one is missed - under-counting names
+    here is exactly the failure mode that would manufacture a false positive.
+    """
+    if path in cache:
+        return cache[path]
+    try:
+        src = open(path, "r", encoding="utf-8", errors="replace").read()
+        top = ast.parse(src)
+    except Exception:
+        cache[path] = None
+        return None
+    names = set()
+    star = [False]
+
+    def note(n):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(n.name)
+        elif isinstance(n, ast.Assign):
+            for tg in n.targets:
+                if isinstance(tg, ast.Name):
+                    names.add(tg.id)
+        elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+            names.add(n.target.id)
+        elif isinstance(n, ast.Import):
+            for al in n.names:
+                names.add((al.asname or al.name).split(".")[0])
+        elif isinstance(n, ast.ImportFrom):
+            for al in n.names:
+                if al.name == "*":
+                    star[0] = True
+                else:
+                    names.add(al.asname or al.name)
+
+    for n in top.body:
+        note(n)
+        if isinstance(n, (ast.If, ast.Try)):
+            for sub in ast.walk(n):
+                note(sub)
+    cache[path] = (names, star[0])
+    return cache[path]
+
+
+def _resolves(mod, name, mm, cache):
+    """True if `name` is visible on module `mod`: a submodule file, or defined/
+    imported/re-exported at `mod`'s top level. False only when both checks
+    have a definite answer and both say no.
+    """
+    if ("%s.%s" % (mod, name)) in mm:
+        return True                   # `from pkg import sub` where sub is pkg/sub.py
+    tgt = mm[mod]
+    tn = _toplevel_names(tgt, cache)
+    if tn is None:
+        return True                   # unparsable: withhold judgement, no false positive
+    names, star = tn
+    if star:
+        return True                   # `from elsewhere import *` in mod: can't rule out
+    return name in names
+
+
+def _broken_in_tree(root):
+    """-> set of (rel_path, module, name) that cannot resolve INSIDE this tree."""
+    mm = _module_map(root)
+    cache = {}
+    out = set()
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d not in _BK_SKIP_DIRS]
+        for f in fn:
+            if not f.endswith(".py"):
+                continue
+            full = os.path.join(dp, f)
+            try:
+                src = open(full, "r", encoding="utf-8", errors="replace").read()
+                tree = ast.parse(src)
+            except Exception:
+                continue
+            rel = os.path.relpath(full, root)
+            pkg = os.path.dirname(rel).replace(os.sep, ".")
+            for n in ast.walk(tree):
+                if isinstance(n, ast.ImportFrom):
+                    mod = n.module or ""
+                    if n.level:                                # relative import
+                        base = pkg.split(".") if pkg else []
+                        if n.level > 1:
+                            base = base[:len(base) - (n.level - 1)]
+                        mod = ".".join([x for x in base if x] + ([mod] if mod else []))
+                    if mod not in mm:
+                        continue                               # third-party/stdlib: skip
+                    for al in n.names:
+                        if al.name == "*":
+                            continue
+                        if not _resolves(mod, al.name, mm, cache):
+                            out.add((rel, mod, al.name))
+                elif isinstance(n, ast.Import):
+                    for al in n.names:
+                        if "." not in al.name:
+                            continue                           # plain `import M`: nothing to check
+                        mod, name = al.name.rsplit(".", 1)
+                        if mod not in mm:
+                            continue
+                        if not _resolves(mod, name, mm, cache):
+                            out.add((rel, mod, name))
+    return out
+
+
+DEFAULT_CHECKER_TIMEOUT = 60.0
+NONZERO_NO_OUTPUT = "<checker exited nonzero, no stdout>"
+
+
+def checker_timeout():
+    v = os.environ.get("MOIRE_CHECKER_TIMEOUT")
+    if v:
+        try:
+            return float(v)
+        except ValueError:
+            pass
+    return DEFAULT_CHECKER_TIMEOUT
+
+
+def run_checker(checker, directory, timeout):
+    """Run the builtin AST checker, or an arbitrary shell command, over `directory`.
+
+    -> frozenset of findings: (path, module, name) tuples for the builtin
+    checker, one string per non-blank stdout line for an external command. A
+    nonzero exit with no stdout still counts as broken (via a fixed sentinel)
+    so it participates correctly in the broken(merged)-broken(self)-broken(peer)
+    set difference - equally-broken-everywhere cancels out instead of being
+    misread as zero findings on every side.
+
+    Raises on timeout (subprocess.TimeoutExpired) or spawn failure; callers
+    must turn that into verdict "error", never into breakage.
+    """
+    if checker == "builtin-ast":
+        return frozenset(_broken_in_tree(directory))
+    p = subprocess.Popen(checker, shell=True, cwd=directory,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        out, _err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        raise
+    lines = set(ln for ln in out.decode("utf-8", "replace").split("\n") if ln.strip())
+    if p.returncode != 0 and not lines:
+        lines.add(NONZERO_NO_OUTPUT)
+    return frozenset(lines)
+
+
+# ------------------------------------------------------------------ finding id
+#
+# A stable id for "this collision", independent of WHEN it was observed. Built
+# only from the two worktree paths and the contested paths themselves - never
+# a tree OID, timestamp, or check_id, all of which change on every single
+# check even when the underlying collision has not moved at all. That
+# stability is what makes recurrence ("still there 20 checks later") and
+# dissolution ("gone now") measurable, and it is what `moire explain` keys notes
+# on: a note attached today must still be findable against the same collision
+# tomorrow.
+
+def _finding_paths(rec):
+    """-> sorted contested paths for a check/verify record, or [] if there is
+    nothing to name: a textual conflict names its own conflict_paths; a
+    textual-clean-but-semantically-broken merge (verify only) names the
+    new_breakage entries instead (their first tuple element for the builtin
+    checker's (path, module, name) triples, the raw line for an external
+    checker). Clean-and-unbroken records get [].
+    """
+    paths = rec.get("conflict_paths") or []
+    if paths:
+        return sorted(paths)
+    sem = rec.get("semantic") or {}
+    breakage = sem.get("new_breakage") or []
+    out = []
+    for item in breakage:
+        if isinstance(item, (list, tuple)) and item:
+            out.append(str(item[0]))
+        else:
+            out.append(str(item))
+    return sorted(out)
+
+
+def compute_finding_id(self_worktree, peer_worktree, paths):
+    """-> 12-hex-char id, or None if `paths` is empty (nothing to identify).
+
+    MUST be symmetric: the same collision observed from either worktree has
+    to yield the identical id, or suppression (each side would roll its own
+    hash -> an unintended one-sided-warning arm) and `moire explain` (an agent
+    files a note under its own id; the peer looks up a different id and never
+    finds it) both silently break. Sorting the two worktree paths before
+    hashing is what buys that - the pair {A, B} hashes the same regardless of
+    which one is "self" for this call.
+    """
+    if not paths:
+        return None
+    wt_a, wt_b = sorted((self_worktree, peer_worktree))
+    h = hashlib.sha1()
+    for part in (wt_a, wt_b, "\x1f".join(sorted(paths))):
+        h.update(part.encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()[:12]
+
+
+# ------------------------------------------------------------- surface arm
+#
+# The project's central question - does an in-flight warning change an
+# agent's behaviour, or is it an expensive no-op - cannot be answered by a
+# between-run A/B: LLM nondeterminism and task-difficulty variance swamp the
+# effect. The alternative is a matched design: every finding is computed and
+# LOGGED regardless, but only a randomised subset is SHOWN to the agent. The
+# assignment must be deterministic on finding_id (never on check_id, a
+# timestamp, or anything that changes run to run) so a given collision lands
+# in the same arm - surfaced or suppressed - every single time it recurs,
+# on both sides. A collision that flickered between arms would contaminate
+# exactly the "does persistence differ by arm" measurement this exists to
+# make possible.
+
+DEFAULT_SURFACE_RATE = 1.0
+
+
+def surface_rate():
+    v = os.environ.get("MOIRE_SURFACE_RATE")
+    if v:
+        try:
+            return float(v)
+        except ValueError:
+            pass
+    return DEFAULT_SURFACE_RATE
+
+
+def surface_salt():
+    """Empty by default; set MOIRE_SURFACE_SALT to a fresh value to re-randomise
+    the surfaced/suppressed assignment for a new study window without
+    changing MOIRE_SURFACE_RATE."""
+    return os.environ.get("MOIRE_SURFACE_SALT", "")
+
+
+def is_surfaced(finding_id, rate, salt):
+    """-> True if this finding should be SHOWN to the agent, at the given
+    rate/salt. Deterministic on finding_id: same id, same rate, same salt
+    always yields the same answer, independent of which side asks or how
+    many times. Short-circuits at the extremes so `rate=1.0` (the default,
+    "surface everything") never touches the hash, and `rate<=0.0` never
+    admits a false positive from a boundary float.
+    """
+    if rate >= 1.0:
+        return True
+    if rate <= 0.0:
+        return False
+    h = hashlib.sha1((salt + finding_id).encode("utf-8")).hexdigest()
+    return (int(h[:8], 16) / 0xFFFFFFFF) < rate
+
+
+# ---------------------------------------------------------------- agent id
+#
+# A label, nothing more. It lets a study split findings cross-agent vs
+# same-agent - the split this project needs because the statistic that used
+# to justify that split as important was found fabricated, not because the
+# label itself is trusted for anything. It MUST NOT reach oracle(),
+# compute_arbiter(), compute_finding_id(), or is_surfaced() - none of those
+# functions take it as an argument, which is the structural guarantee (not a
+# discipline to remember) that an agent's self-declared identity can never
+# move a verdict, a suppression decision, or an arbiter recommendation.
+
+def _agent_marker_file(cd, worktree):
+    h = hashlib.sha1(worktree.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(state_dir(cd), "agents", h + ".json")
+
+
+def write_agent_marker(cd, worktree, agent_id):
+    """Record `worktree`'s current MOIRE_AGENT_ID for peers to read. Temp-file +
+    os.rename, same pattern as the log shards and snapshot cache: a reader
+    never observes a partially-written marker.
+    """
+    d = os.path.join(state_dir(cd), "agents")
+    try:
+        os.makedirs(d)
+    except OSError:
+        pass
+    rec = {"worktree": worktree, "agent_id": agent_id,
+           "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
+    path = _agent_marker_file(cd, worktree)
+    tmp = "%s.tmp-%d-%s" % (path, os.getpid(), uuid.uuid4().hex[:6])
+    try:
+        with open(tmp, "w") as f:
+            json.dump(rec, f)
+        os.rename(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def read_agent_marker(cd, worktree):
+    """-> the peer's declared agent_id, or None if its marker is missing,
+    unparsable, or has never been written (e.g. it has not run `moire
+    check`/`verify` since this feature shipped)."""
+    if not cd:
+        return None
+    try:
+        with open(_agent_marker_file(cd, worktree)) as f:
+            rec = json.load(f)
+    except Exception:
+        return None
+    return rec.get("agent_id")
+
+
+# --------------------------------------------------------------- explain notes
+#
+# Notes are agent-authored, untrusted text about to enter ANOTHER agent's
+# context (the peer's, via its own `moire check`/`verify` output). They are
+# rendered strictly AFTER a verdict is final: every function below only
+# READS already-computed records (verdict, conflict_paths, semantic,
+# finding_id) and only ever ADDS a "peer_notes" key. None of them are called
+# from, or pass anything into, oracle()/oracle_tree()/run_checker()/
+# compute_arbiter() - the functions that actually decide a verdict. This is
+# the enforcement of the non-negotiable rule that declared text cannot move a
+# verdict: it is not a discipline the code has to remember to uphold, it is a
+# consequence of which functions call which.
+
+def _sanitize_note_text(text, maxlen=NOTE_MAX_CHARS):
+    """Strip control characters (this is untrusted text entering another
+    agent's context) and cap length. Applied both when a note is written and
+    again whenever one is displayed/embedded, so a note file edited by hand
+    outside `moire explain` cannot smuggle more than a plain capped sentence.
+    """
+    cleaned = "".join(ch for ch in text if ch == " " or ch == "\t" or ord(ch) >= 32)
+    cleaned = cleaned.strip()
+    return cleaned[:maxlen]
+
+
+def read_notes_for(cd, finding_id, peer_worktree):
+    """-> [{'ts':..., 'text':...}, ...] sorted oldest-first: every note filed
+    against `finding_id` whose author worktree is `peer_worktree` - i.e. only
+    notes the PEER wrote about THIS finding, never our own. Missing notes dir,
+    unparsable note file, or no finding_id all resolve to [].
+    """
+    if not finding_id or not cd:
+        return []
+    nd = notes_dir(cd)
+    if not os.path.isdir(nd):
+        return []
+    try:
+        names = os.listdir(nd)
+    except OSError:
+        return []
+    peer_real = os.path.realpath(peer_worktree)
+    prefix = finding_id + "-"
+    out = []
+    for fn in names:
+        if not fn.startswith(prefix) or not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(nd, fn)) as f:
+                note = json.load(f)
+        except Exception:
+            continue
+        nw = note.get("worktree")
+        if not nw or os.path.realpath(nw) != peer_real:
+            continue
+        text = _sanitize_note_text(str(note.get("text") or ""))
+        if not text:
+            continue
+        # `source` distinguishes a pre-existing task description (written before
+        # the work, by whoever dispatched it) from an agent's post-hoc account of
+        # itself. Those are different epistemic objects and must not be conflated:
+        # an agent's account of its own scope is unreliable; a task description
+        # is not a self-report at all. Unknown/absent -> "agent", the weaker
+        # assumption.
+        src = note.get("source")
+        if src not in ("task", "agent", "human"):
+            src = "agent"
+        out.append({"ts": note.get("ts"), "source": src, "text": text})
+    out.sort(key=lambda n: n.get("ts") or "")
+    return out
+
+
+def decorate_with_notes(records, cd):
+    """Second pass, run only AFTER every record's verdict/finding_id is final.
+    Adds "peer_notes"; never touches verdict, conflict_paths, or semantic.
+    """
+    for rec in records:
+        fid = rec.get("finding_id")
+        peer_wt = (rec.get("peer") or {}).get("worktree")
+        rec["peer_notes"] = read_notes_for(cd, fid, peer_wt) if (fid and peer_wt) else []
+
+
+# -------------------------------------------------------------------- arbiter
+#
+# A recommendation, computed identically by both sides from facts each can
+# observe about ITSELF and about the OTHER worktree directly - no declared
+# state, no coordinating process, no CI/"finished-green" signal (that would
+# require the peer to assert something about itself, which is exactly the
+# self-report this project's own measurement showed makes things worse, not
+# better: pre-write admission over declared scope has been measured to
+# perform no better than no coordination at all -- see arXiv:2608.00947).
+# Every rule below is symmetric by construction: it always
+# picks the SAME worktree as the yielding one no matter which side's `moire`
+# process evaluates it, because it only ever compares two absolute values
+# (adoptable?, file count, commit count, name) that do not depend on which
+# one is labelled "self" for this call.
+
+def _is_adoptable(head, tree, head_tree):
+    """True if `tree` (the full observed state: HEAD + staged + unstaged +
+    untracked, from the same copied-index snapshot the oracle uses) is
+    identical to the tree of the worktree's own HEAD commit - i.e. nothing
+    uncommitted. Deliberately does NOT run `git status`: status can rewrite
+    the target's real index (refreshing its stat cache), which would mutate
+    the very worktree we are only supposed to be observing. `head`/`tree`/
+    `head_tree` are all already-computed OIDs; this is a pure string compare.
+    No HEAD at all (a brand-new repo) is never adoptable - there is nothing
+    committed to adopt onto.
+    """
+    if not head or not tree:
+        return False
+    return head_tree is not None and head_tree == tree
+
+
+def _diff_file_count(git, cwd, merge_base, commit):
+    if not merge_base or not commit:
+        return None
+    out = git.out(["diff", "--name-only", merge_base, commit], cwd=cwd)
+    if out is None:
+        return None
+    return len([ln for ln in out.split("\n") if ln.strip()])
+
+
+def _commits_ahead(git, cwd, merge_base, commit):
+    if not merge_base or not commit:
+        return None
+    out = git.out(["rev-list", "--count", "%s..%s" % (merge_base, commit)], cwd=cwd)
+    if out is None:
+        return None
+    try:
+        return int(out)
+    except ValueError:
+        return None
+
+
+def compute_arbiter(git, top, self_info, peer_info, self_tree, self_commit, peer_tree, peer_commit):
+    """-> the arbiter dict for a conflict/breakage record. `top` is the cwd
+    plumbing runs in (self's worktree; shares the object store with every
+    peer, so commit/tree OIDs from either side resolve from here). Never
+    executes a rebase - this is a recommendation only, and `stack_viable`
+    never attempts a trial rebase to answer itself (that would mutate
+    state); it withholds ("unknown") rather than guess.
+    """
+    self_wt, peer_wt = self_info["worktree"], peer_info["worktree"]
+    self_head, peer_head = self_info.get("head"), peer_info.get("head")
+
+    self_head_tree = git.out(["rev-parse", self_head + "^{tree}"], cwd=top) if self_head else None
+    peer_head_tree = git.out(["rev-parse", peer_head + "^{tree}"], cwd=top) if peer_head else None
+    self_adoptable = _is_adoptable(self_head, self_tree, self_head_tree)
+    peer_adoptable = _is_adoptable(peer_head, peer_tree, peer_head_tree)
+
+    merge_base = (git.out(["merge-base", self_commit, peer_commit], cwd=top)
+                  if self_commit and peer_commit else None)
+    self_diff = _diff_file_count(git, top, merge_base, self_commit)
+    peer_diff = _diff_file_count(git, top, merge_base, peer_commit)
+    self_ahead = _commits_ahead(git, top, merge_base, self_commit)
+    peer_ahead = _commits_ahead(git, top, merge_base, peer_commit)
+
+    self_name = self_info.get("branch") or self_wt
+    peer_name = peer_info.get("branch") or peer_wt
+    if self_name == peer_name:
+        self_name, peer_name = self_wt, peer_wt
+
+    if self_adoptable != peer_adoptable:
+        # Rule 1 - adoptability: the side WITHOUT fully-committed work yields
+        # onto the side that has one.
+        if self_adoptable:
+            yield_side, reason = "peer", "adoptability: peer has uncommitted work, self is fully committed"
+        else:
+            yield_side, reason = "self", "adoptability: self has uncommitted work, peer is fully committed"
+    elif self_diff is not None and peer_diff is not None and self_diff != peer_diff:
+        # Rule 2 - diff size: the smaller diff yields (cheaper to replay).
+        if self_diff < peer_diff:
+            yield_side, reason = "self", "diff size: self changed fewer files (%d vs %d)" % (self_diff, peer_diff)
+        else:
+            yield_side, reason = "peer", "diff size: peer changed fewer files (%d vs %d)" % (peer_diff, self_diff)
+    elif self_ahead is not None and peer_ahead is not None and self_ahead != peer_ahead:
+        # Rule 3 - branch age: fewer commits ahead of the merge-base yields.
+        if self_ahead < peer_ahead:
+            yield_side, reason = "self", "branch age: self has fewer commits ahead (%d vs %d)" % (self_ahead, peer_ahead)
+        else:
+            yield_side, reason = "peer", "branch age: peer has fewer commits ahead (%d vs %d)" % (peer_ahead, self_ahead)
+    else:
+        # Rule 4 - deterministic tiebreak: lexicographically GREATER name
+        # yields. Symmetric: whichever of the two literal strings is greater
+        # always yields, regardless of which side is "self" for this call.
+        if self_name > peer_name:
+            yield_side, reason = "self", "tiebreak: self's name %r > peer's %r" % (self_name, peer_name)
+        else:
+            yield_side, reason = "peer", "tiebreak: peer's name %r > self's %r" % (peer_name, self_name)
+
+    winner_adoptable = peer_adoptable if yield_side == "self" else self_adoptable
+    if not winner_adoptable:
+        stack_viable, stack_blocker = False, "winner has uncommitted work: nothing to rebase onto"
+    else:
+        stack_viable, stack_blocker = "unknown", None
+
+    return {
+        "yield": yield_side, "reason": reason,
+        "stack_viable": stack_viable, "stack_blocker": stack_blocker,
+        "inputs": {
+            "self": {"name": self_info.get("branch"), "adoptable": self_adoptable,
+                     "diff_files": self_diff, "commits_ahead": self_ahead},
+            "peer": {"name": peer_info.get("branch"), "adoptable": peer_adoptable,
+                     "diff_files": peer_diff, "commits_ahead": peer_ahead},
+        },
+    }
+
+
+# ------------------------------------------------------------------- commands
+
+def _require_git(git):
+    if git.path is None or git.version < MIN_GIT:
+        have = ("%s (%s)" % (git.version_str, git.path)) if git.path else "none found"
+        sys.stderr.write(
+            "moire: git >= %d.%d is required; found %s\n"
+            "    Legacy `git merge-tree` silently misses rename/rename, modify/delete\n"
+            "    and binary conflicts. Refusing to emit a verdict rather than degrade.\n"
+            "    Set MOIRE_GIT=/path/to/git or install a newer git.\n" % (MIN_GIT[0], MIN_GIT[1], have))
+        return False
+    return True
+
+
+def cmd_check(git, argv):
+    as_json = "--json" in argv
+    peers_arg = None
+    if "--peers" in argv:
+        i = argv.index("--peers")
+        if i + 1 < len(argv):
+            peers_arg = argv[i + 1]
+    if peers_arg is None:
+        peers_arg = os.environ.get("MOIRE_PEERS")
+
+    if not _require_git(git):
+        return 2                      # refuse; write no log
+
+    cwd = os.getcwd()
+    top = git.out(["rev-parse", "--show-toplevel"], cwd=cwd)
+    if not top:
+        sys.stderr.write("moire: not inside a git worktree\n")
+        return 2
+    top = os.path.realpath(top)
+    cd = common_dir(git, cwd)
+
+    wts = list_worktrees(git, cwd)
+    me = None
+    for w in wts:
+        if w["worktree"] == top:
+            me = w
+    if me is None:
+        me = {"worktree": top, "head": git.out(["rev-parse", "HEAD"], cwd=cwd), "branch": None}
+
+    if peers_arg:
+        peers = []
+        for p in peers_arg.split(","):
+            p = p.strip()
+            if not p:
+                continue
+            p = os.path.realpath(p)
+            found = None
+            for w in wts:
+                if w["worktree"] == p:
+                    found = w
+            peers.append(found or {"worktree": p, "head": None, "branch": None})
+    else:
+        peers = [w for w in wts if w["worktree"] != top]
+
+    check_id = str(uuid.uuid4())
+    ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    records = []
+    rate, salt = surface_rate(), surface_salt()
+    agent_id = os.environ.get("MOIRE_AGENT_ID")     # a label only - see the module note above write_agent_marker
+    if cd:
+        write_agent_marker(cd, top, agent_id)
+
+    # Self is ALWAYS recomputed - never served from cache. The agent invoking
+    # `moire check` just wrote; a stale self-snapshot is the one error that would
+    # silently produce a wrong verdict. We still publish the result into the
+    # cache (below) so THIS worktree, acting as somebody else's peer, is a
+    # cache hit for them.
+    try:
+        my_tree, my_commit = snapshot(git, top)
+        my_err = None
+        if cd:
+            idx_mtime, idx_size = _index_fingerprint(git, top)
+            write_snapshot_cache(cd, top, my_tree, my_commit, me.get("head"), idx_mtime, idx_size)
+    except Exception as ex:
+        my_tree, my_commit, my_err = None, None, str(ex)
+
+    for p in peers:
+        t0 = time.time()
+        phead = p.get("head")
+        if phead is None and os.path.isdir(p["worktree"]):
+            phead = git.out(["rev-parse", "HEAD"], cwd=p["worktree"])
+        self_info = {"worktree": top, "branch": me.get("branch"), "head": me.get("head")}
+        peer_info = {"worktree": p["worktree"], "branch": p.get("branch"), "head": phead}
+        rec = {
+            "v": 1, "check_id": check_id, "ts": ts, "repo_common_dir": cd,
+            "self": {"worktree": top, "branch": me.get("branch"),
+                     "head": me.get("head"), "tree": my_tree, "agent_id": agent_id},
+            "peer": {"worktree": p["worktree"], "branch": p.get("branch"),
+                     "head": phead, "tree": None,
+                     "agent_id": read_agent_marker(cd, p["worktree"]) if cd else None},
+            "verdict": "error", "conflict_paths": [],
+            "git_version": git.version_str, "oracle": "merge-tree --write-tree",
+            "duration_ms": 0, "error": None,
+            "cached": {"self": False, "peer": False},
+            "finding_id": None, "arbiter": None,
+            # unaffected by suppression when there is no finding to suppress
+            "surfaced": True, "surface_rate": rate, "surface_salt": salt,
+        }
+        try:
+            if my_err:
+                raise RuntimeError("self snapshot failed: %s" % my_err)
+            if not os.path.isdir(p["worktree"]):
+                raise RuntimeError("peer worktree missing: %s" % p["worktree"])
+            if cd:
+                ptree, pcommit, peer_cached = snapshot_peer_cached(git, p["worktree"], cd, phead)
+            else:
+                ptree, pcommit = snapshot(git, p["worktree"])
+                peer_cached = False
+            rec["peer"]["tree"] = ptree
+            rec["cached"]["peer"] = peer_cached
+            verdict, paths = oracle(git, top, my_commit, pcommit)
+            rec["verdict"] = verdict
+            rec["conflict_paths"] = paths
+            fid = compute_finding_id(top, p["worktree"], _finding_paths(rec))
+            rec["finding_id"] = fid
+            if fid:
+                rec["surfaced"] = is_surfaced(fid, rate, salt)
+                rec["arbiter"] = compute_arbiter(git, top, self_info, peer_info,
+                                                 my_tree, my_commit, ptree, pcommit)
+        except Exception as ex:
+            rec["verdict"] = "error"
+            rec["error"] = str(ex)
+        rec["duration_ms"] = int((time.time() - t0) * 1000)
+        records.append(rec)
+
+    # Notes are read ONLY here, strictly after every verdict above is final -
+    # this pass reads finding_id/peer worktree and adds "peer_notes"; it never
+    # feeds anything back into a verdict.
+    decorate_with_notes(records, cd)
+
+    # one shard file per invocation - never a shared append file
+    if cd:
+        ld = log_dir(cd)
+        try:
+            os.makedirs(ld)
+        except OSError:
+            pass
+        name = "%s-%d-%s.json" % (datetime.utcnow().strftime("%Y%m%dT%H%M%S%f"),
+                                  os.getpid(), uuid.uuid4().hex[:6])
+        tmp = os.path.join(ld, "." + name + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(records, f)
+        os.rename(tmp, os.path.join(ld, name))
+
+    if as_json:
+        # tooling output, not agent-facing: includes suppressed findings too
+        sys.stdout.write(json.dumps(records, indent=2) + "\n")
+    else:
+        if not records:
+            sys.stdout.write("moire: no peer worktrees\n")
+        for r in records:
+            peer = r["peer"]["worktree"]
+            if r["verdict"] == "conflict":
+                if not r.get("surfaced", True):
+                    continue           # suppressed: logged above in full, but the agent sees nothing
+                sys.stdout.write("CONFLICT with %s (%s) [finding %s]\n" %
+                                 (peer, r["peer"]["branch"] or "detached", r.get("finding_id")))
+                for pth in r["conflict_paths"]:
+                    sys.stdout.write("    %s\n" % pth)
+                for note in r.get("peer_notes") or []:
+                    sys.stdout.write("    peer (%s): %s\n" % (note.get("source","agent"), note["text"]))
+                arb = r.get("arbiter")
+                if arb:
+                    sys.stdout.write("  arbiter: %s yields (%s)\n" % (arb["yield"], arb["reason"]))
+                sys.stdout.write("  actions: rebase onto theirs | narrow your change | "
+                                 "retarget | wait for them to land | proceed\n")
+            elif r["verdict"] == "error":
+                sys.stdout.write("error   with %s: %s\n" % (peer, r["error"]))
+            else:
+                sys.stdout.write("clean   with %s\n" % peer)
+    return 0                          # warn-only: always 0
+
+
+def cmd_verify(git, argv):
+    """Exact semantic check on the speculative tree `merge-tree` already produced.
+
+    Per peer: snapshot both, run the textual oracle. If it conflicts, there is
+    nothing to verify (it will not merge) - record that and stop. If clean,
+    materialise self's tree, peer's tree, and the never-attempted merged tree
+    into throwaway directories (no worktree, no checkout, nothing mutated), run
+    the checker over each, and report new breakage = broken(merged) -
+    broken(self) - broken(peer). Breakage already present in a parent is that
+    agent's own problem, not a collision this pair created. Warn-only, like
+    check: always exits 0.
+    """
+    as_json = "--json" in argv
+    peers_arg = None
+    checker = "builtin-ast"
+    if "--peers" in argv:
+        i = argv.index("--peers")
+        if i + 1 < len(argv):
+            peers_arg = argv[i + 1]
+    if peers_arg is None:
+        peers_arg = os.environ.get("MOIRE_PEERS")
+    if "--checker" in argv:
+        i = argv.index("--checker")
+        if i + 1 < len(argv):
+            checker = argv[i + 1]
+
+    if not _require_git(git):
+        return 2                      # refuse; write no log
+
+    cwd = os.getcwd()
+    top = git.out(["rev-parse", "--show-toplevel"], cwd=cwd)
+    if not top:
+        sys.stderr.write("moire: not inside a git worktree\n")
+        return 2
+    top = os.path.realpath(top)
+    cd = common_dir(git, cwd)
+
+    wts = list_worktrees(git, cwd)
+    me = None
+    for w in wts:
+        if w["worktree"] == top:
+            me = w
+    if me is None:
+        me = {"worktree": top, "head": git.out(["rev-parse", "HEAD"], cwd=cwd), "branch": None}
+
+    if peers_arg:
+        peers = []
+        for p in peers_arg.split(","):
+            p = p.strip()
+            if not p:
+                continue
+            p = os.path.realpath(p)
+            found = None
+            for w in wts:
+                if w["worktree"] == p:
+                    found = w
+            peers.append(found or {"worktree": p, "head": None, "branch": None})
+    else:
+        peers = [w for w in wts if w["worktree"] != top]
+
+    check_id = str(uuid.uuid4())
+    ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    records = []
+    timeout = checker_timeout()
+    rate, salt = surface_rate(), surface_salt()
+    agent_id = os.environ.get("MOIRE_AGENT_ID")     # a label only - see the module note above write_agent_marker
+    if cd:
+        write_agent_marker(cd, top, agent_id)
+
+    # Self is ALWAYS recomputed - see cmd_check for why. Publish into the
+    # cache too so this worktree is a cache hit when someone else's `moire
+    # verify`/`check` treats it as a peer.
+    try:
+        my_tree, my_commit = snapshot(git, top)
+        my_err = None
+        if cd:
+            idx_mtime, idx_size = _index_fingerprint(git, top)
+            write_snapshot_cache(cd, top, my_tree, my_commit, me.get("head"), idx_mtime, idx_size)
+    except Exception as ex:
+        my_tree, my_commit, my_err = None, None, str(ex)
+
+    for p in peers:
+        t0 = time.time()
+        phead = p.get("head")
+        if phead is None and os.path.isdir(p["worktree"]):
+            phead = git.out(["rev-parse", "HEAD"], cwd=p["worktree"])
+        self_info = {"worktree": top, "branch": me.get("branch"), "head": me.get("head")}
+        peer_info = {"worktree": p["worktree"], "branch": p.get("branch"), "head": phead}
+        rec = {
+            "v": 1, "check_id": check_id, "ts": ts, "repo_common_dir": cd,
+            "self": {"worktree": top, "branch": me.get("branch"),
+                     "head": me.get("head"), "tree": my_tree, "agent_id": agent_id},
+            "peer": {"worktree": p["worktree"], "branch": p.get("branch"),
+                     "head": phead, "tree": None,
+                     "agent_id": read_agent_marker(cd, p["worktree"]) if cd else None},
+            "verdict": "error", "conflict_paths": [],
+            "git_version": git.version_str, "oracle": "merge-tree --write-tree",
+            "duration_ms": 0, "error": None, "semantic": None,
+            "cached": {"self": False, "peer": False},
+            "finding_id": None, "arbiter": None,
+            # unaffected by suppression when there is no finding to suppress
+            "surfaced": True, "surface_rate": rate, "surface_salt": salt,
+        }
+        tmp_dirs = []
+        try:
+            if my_err:
+                raise RuntimeError("self snapshot failed: %s" % my_err)
+            if not os.path.isdir(p["worktree"]):
+                raise RuntimeError("peer worktree missing: %s" % p["worktree"])
+            if cd:
+                ptree, pcommit, peer_cached = snapshot_peer_cached(git, p["worktree"], cd, phead)
+            else:
+                ptree, pcommit = snapshot(git, p["worktree"])
+                peer_cached = False
+            rec["peer"]["tree"] = ptree
+            rec["cached"]["peer"] = peer_cached
+            verdict, paths, merged_tree = oracle_tree(git, top, my_commit, pcommit)
+            rec["verdict"] = verdict
+            rec["conflict_paths"] = paths
+            if verdict == "clean":
+                # nothing to verify on a textual conflict: it will not merge as-is
+                t1 = time.time()
+                self_dir = tempfile.mkdtemp(prefix="moire-verify-self-")
+                peer_dir = tempfile.mkdtemp(prefix="moire-verify-peer-")
+                merged_dir = tempfile.mkdtemp(prefix="moire-verify-merged-")
+                tmp_dirs = [self_dir, peer_dir, merged_dir]
+                materialize_tree(git, top, my_tree, self_dir)
+                materialize_tree(git, top, ptree, peer_dir)
+                materialize_tree(git, top, merged_tree, merged_dir)
+                self_broken = run_checker(checker, self_dir, timeout)
+                peer_broken = run_checker(checker, peer_dir, timeout)
+                merged_broken = run_checker(checker, merged_dir, timeout)
+                new_breakage = merged_broken - self_broken - peer_broken
+                rec["semantic"] = {
+                    "checker": checker,
+                    "merged_tree": merged_tree,
+                    "new_breakage": sorted([list(x) for x in new_breakage],
+                                           key=lambda x: [str(e) for e in x]),
+                    "self_broken": len(self_broken),
+                    "peer_broken": len(peer_broken),
+                    "merged_broken": len(merged_broken),
+                    "duration_ms": int((time.time() - t1) * 1000),
+                }
+            fid = compute_finding_id(top, p["worktree"], _finding_paths(rec))
+            rec["finding_id"] = fid
+            if fid:
+                rec["surfaced"] = is_surfaced(fid, rate, salt)
+                rec["arbiter"] = compute_arbiter(git, top, self_info, peer_info,
+                                                 my_tree, my_commit, ptree, pcommit)
+        except Exception as ex:
+            rec["verdict"] = "error"      # covers a checker timeout too - never breakage
+            rec["semantic"] = None
+            rec["error"] = str(ex)
+        finally:
+            for d in tmp_dirs:
+                shutil.rmtree(d, ignore_errors=True)
+        rec["duration_ms"] = int((time.time() - t0) * 1000)
+        records.append(rec)
+
+    # Notes are read ONLY here, strictly after every verdict above is final -
+    # same non-negotiable as cmd_check.
+    decorate_with_notes(records, cd)
+
+    # one log shard file per invocation - never a shared append - same layout as check
+    if cd:
+        ld = log_dir(cd)
+        try:
+            os.makedirs(ld)
+        except OSError:
+            pass
+        name = "%s-%d-%s.json" % (datetime.utcnow().strftime("%Y%m%dT%H%M%S%f"),
+                                  os.getpid(), uuid.uuid4().hex[:6])
+        tmp = os.path.join(ld, "." + name + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(records, f)
+        os.rename(tmp, os.path.join(ld, name))
+
+    if as_json:
+        # tooling output, not agent-facing: includes suppressed findings too
+        sys.stdout.write(json.dumps(records, indent=2) + "\n")
+    else:
+        if not records:
+            sys.stdout.write("moire: no peer worktrees\n")
+        for r in records:
+            peer = r["peer"]["worktree"]
+            if r["verdict"] == "conflict":
+                if not r.get("surfaced", True):
+                    continue           # suppressed: logged above in full, but the agent sees nothing
+                sys.stdout.write("CONFLICT with %s (%s) - textual; semantic check skipped [finding %s]\n" %
+                                 (peer, r["peer"]["branch"] or "detached", r.get("finding_id")))
+                for pth in r["conflict_paths"]:
+                    sys.stdout.write("    %s\n" % pth)
+                for note in r.get("peer_notes") or []:
+                    sys.stdout.write("    peer (%s): %s\n" % (note.get("source","agent"), note["text"]))
+                arb = r.get("arbiter")
+                if arb:
+                    sys.stdout.write("  arbiter: %s yields (%s)\n" % (arb["yield"], arb["reason"]))
+            elif r["verdict"] == "error":
+                sys.stdout.write("error   with %s: %s\n" % (peer, r["error"]))
+            else:
+                sem = r["semantic"] or {}
+                new = sem.get("new_breakage") or []
+                if new:
+                    if not r.get("surfaced", True):
+                        continue       # suppressed: logged above in full, but the agent sees nothing
+                    sys.stdout.write("BROKEN  with %s (%d new breakage(s), merged tree %s) [finding %s]\n" %
+                                     (peer, len(new), sem.get("merged_tree"), r.get("finding_id")))
+                    for item in new:
+                        sys.stdout.write("    %s\n" % (tuple(item),))
+                    for note in r.get("peer_notes") or []:
+                        sys.stdout.write("    peer (%s): %s\n" % (note.get("source","agent"), note["text"]))
+                    arb = r.get("arbiter")
+                    if arb:
+                        sys.stdout.write("  arbiter: %s yields (%s)\n" % (arb["yield"], arb["reason"]))
+                else:
+                    sys.stdout.write(
+                        "clean   with %s (semantic ok: self=%d peer=%d merged=%d broken)\n" %
+                        (peer, sem.get("self_broken", 0), sem.get("peer_broken", 0),
+                         sem.get("merged_broken", 0)))
+    return 0                          # warn-only: always 0
+
+
+def cmd_explain(git, argv):
+    """`moire explain <finding_id> <text...>` - file a human/agent note against a
+    finding, for display ONLY. Writes a note file; does not touch, read, or
+    require a verdict. The note becomes visible to the PEER the next time it
+    runs `check`/`verify` and gets the same finding_id from the other side -
+    see decorate_with_notes(), which runs after that peer's verdict is final.
+    """
+    usage = ("moire: usage: moire explain <finding_id> <text...|-> [--source task|agent|human]\n"
+             "    --source task   text came from a pre-existing task/ticket/prompt (no LLM call)\n"
+             "    --source agent  the agent's own post-hoc account (a self-report)\n"
+             "    --source human  written by a person\n"
+             "    text of '-' reads from stdin, so a harness can pipe a ticket verbatim\n")
+    source = "agent"
+    args = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--source" and i + 1 < len(argv):
+            source = argv[i + 1]
+            i += 2
+            continue
+        args.append(argv[i])
+        i += 1
+    if source not in ("task", "agent", "human"):
+        sys.stderr.write("moire: --source must be one of task|agent|human\n" + usage)
+        return 2
+    if len(args) < 2:
+        sys.stderr.write(usage)
+        return 2
+    finding_id = args[0]
+    text = " ".join(args[1:]).strip()
+    if text == "-":
+        text = sys.stdin.read().strip()
+    if not text:
+        sys.stderr.write(usage)
+        return 2
+
+    if not _require_git(git):
+        return 2
+
+    cwd = os.getcwd()
+    top = git.out(["rev-parse", "--show-toplevel"], cwd=cwd)
+    if not top:
+        sys.stderr.write("moire: not inside a git worktree\n")
+        return 2
+    top = os.path.realpath(top)
+    cd = common_dir(git, cwd)
+    if not cd:
+        sys.stderr.write("moire: could not resolve git common dir\n")
+        return 2
+
+    wts = list_worktrees(git, cwd)
+    me = None
+    for w in wts:
+        if w["worktree"] == top:
+            me = w
+    branch = me.get("branch") if me else None
+
+    nd = notes_dir(cd)
+    try:
+        os.makedirs(nd)
+    except OSError:
+        pass
+    note = {
+        "v": 1, "finding_id": finding_id,
+        "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "worktree": top, "branch": branch,
+        "source": source,
+        "text": _sanitize_note_text(text),
+    }
+    name = "%s-%s-%d.json" % (finding_id, datetime.utcnow().strftime("%Y%m%dT%H%M%S%f"), os.getpid())
+    path = os.path.join(nd, name)
+    tmp = os.path.join(nd, "." + name + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(note, f)
+    os.rename(tmp, path)
+    sys.stdout.write("noted: %s\n" % path)
+    return 0
+
+
+def cmd_doctor(git, argv):
+    cwd = os.getcwd()
+    healthy = [True]
+
+    def say(good, label, detail=""):
+        healthy[0] = healthy[0] and good
+        sys.stdout.write("[%s] %s%s\n" % ("ok" if good else "FAIL", label,
+                                          (" - " + detail) if detail else ""))
+
+    good = git.path is not None and git.version >= MIN_GIT
+    say(good, "git >= %d.%d" % MIN_GIT,
+        ("%s at %s" % (git.version_str, git.path)) if git.path else "not found")
+
+    top = git.out(["rev-parse", "--show-toplevel"], cwd=cwd) if git.path else None
+    say(top is not None, "inside a git worktree", top or "no")
+    if not top:
+        return 1
+    cd = common_dir(git, cwd)
+    say(cd is not None and os.path.isdir(cd), "git common dir resolved", cd or "no")
+    if not cd or not os.path.isdir(cd):
+        return 1                      # everything below dereferences cd
+
+    hp = git.out(["config", "--get", "core.hooksPath"], cwd=cwd)
+    say(not hp, "core.hooksPath unset",
+        "SET TO %r - this silently disables hooks in linked worktrees and lets any "
+        "branch execute code on commit; run: git config --unset core.hooksPath" % hp if hp else "")
+
+    for h in HOOKS:
+        pth = os.path.join(cd, "hooks", h)
+        present = os.path.exists(pth) and HOOK_MARKER in open(pth).read()
+        say(present, "hook installed: %s" % h, pth)
+
+    b = installed_bin(cd)
+    say(os.path.exists(b) and os.access(b, os.X_OK), "binary installed", b)
+
+    ld = log_dir(cd)
+    writable = True
+    try:
+        os.makedirs(ld)
+    except OSError:
+        pass
+    try:
+        probe = os.path.join(ld, ".probe")
+        open(probe, "w").close()
+        os.unlink(probe)
+    except Exception as ex:
+        writable = False
+        say(False, "state dir writable", str(ex))
+    if writable:
+        say(True, "state dir writable", ld)
+
+    wts = list_worktrees(git, cwd)
+    say(True, "worktrees discoverable", "%d found" % len(wts))
+
+    return 0 if healthy[0] else 1
+
+
+CLIENT_HOOKS = """\
+# Claude Code - add to .claude/settings.json (or ~/.claude/settings.json):
+{
+  "hooks": {
+    "PostToolUse": [
+      {"matcher": "Edit|Write|MultiEdit|Bash",
+       "hooks": [{"type": "command", "command": "%(bin)s check"}]}
+    ]
+  }
+}
+
+# Codex CLI - .codex/hooks.json:
+{"hooks": {"PostToolUse": [{"matcher": "*", "command": ["%(bin)s", "check"]}]}}
+
+# Cursor - .cursor/hooks.json:
+{"hooks": {"postToolUse": [{"command": "%(bin)s check"}]}}
+
+# OpenCode - .opencode/plugins/moire.ts:
+export default { "tool.execute.after": async () => {
+  await Bun.$`%(bin)s check`; } }
+"""
+
+
+def cmd_install(git, argv):
+    cwd = os.getcwd()
+    if not _require_git(git):
+        return 2
+    cd = common_dir(git, cwd)
+    if not cd:
+        sys.stderr.write("moire: not inside a git worktree\n")
+        return 2
+
+    dest = installed_bin(cd)
+    if "--print-client-hooks" in argv:
+        sys.stdout.write(CLIENT_HOOKS % {"bin": dest})
+        return 0
+
+    try:
+        os.makedirs(os.path.dirname(dest))
+    except OSError:
+        pass
+    src = os.path.realpath(__file__)
+    if os.path.realpath(dest) != src:
+        shutil.copyfile(src, dest)
+    os.chmod(dest, 0o755)
+    sys.stdout.write("installed binary: %s\n" % dest)
+
+    hooks_dir = os.path.join(cd, "hooks")
+    try:
+        os.makedirs(hooks_dir)
+    except OSError:
+        pass
+
+    for h in HOOKS:
+        path = os.path.join(hooks_dir, h)
+        chained = path + ".moire-chained"
+        if os.path.exists(path):
+            body = open(path).read()
+            if HOOK_MARKER in body:
+                sys.stdout.write("hook already installed: %s\n" % path)
+                continue
+            # preserve the pre-existing hook and call it from ours
+            shutil.move(path, chained)
+            os.chmod(chained, 0o755)
+        script = "#!/bin/sh\n%s\n" % HOOK_MARKER
+        if os.path.exists(chained):
+            script += '[ -x "$0.moire-chained" ] && "$0.moire-chained" "$@"\n'
+        script += '"%s" check >/dev/null 2>&1 || true\n' % dest
+        script += "# <<< moire hook <<<\n"
+        with open(path, "w") as f:
+            f.write(script)
+        os.chmod(path, 0o755)
+        sys.stdout.write("installed hook: %s%s\n" % (path, " (chained)" if os.path.exists(chained) else ""))
+
+    hp = git.out(["config", "--get", "core.hooksPath"], cwd=cwd)
+    if hp:
+        sys.stdout.write("WARNING: core.hooksPath is set to %r - hooks in the common dir "
+                         "will NOT fire. Run: git config --unset core.hooksPath\n" % hp)
+    sys.stdout.write("\nClient hooks are NOT installed automatically. "
+                     "Run `moire install --print-client-hooks` for the snippets.\n")
+    return 0
+
+
+def _read_log_records(ld):
+    """-> (records, checks): every record across every shard file in `ld`, and
+    the shard (= check/verify invocation) count. Skips dotfiles (in-progress
+    temp shards, still mid-rename) and any shard that fails to parse - a
+    reader must never choke on a shard another process is still writing.
+    Shared by the plain report and `--study`, which both start from exactly
+    the same accumulated log; deriving `--study` from anything else would
+    violate "do not add new state files or counters".
+    """
+    records, checks = [], 0
+    if os.path.isdir(ld):
+        for fn in sorted(os.listdir(ld)):
+            if not fn.endswith(".json") or fn.startswith("."):
+                continue
+            try:
+                with open(os.path.join(ld, fn)) as f:
+                    arr = json.load(f)
+            except Exception:
+                continue
+            checks += 1
+            if isinstance(arr, list):
+                records.extend(arr)
+    return records, checks
+
+
+# --------------------------------------------------------------- study report
+#
+# Everything below is derived by re-reading the same log shards `moire report`
+# already reads - no new state file, no counter maintained incrementally by
+# `check`/`verify`. That is deliberate: concurrent writers make
+# read-modify-write racy (graft #10's own lesson, one shard per invocation,
+# generalises to "don't maintain shared mutable summaries either"), and the
+# shards already contain everything a study needs, including - since the
+# `finding_id` fix above - a stable identity for "this collision" that both
+# sides agree on.
+
+STUDY_MIN_N = 20     # refuse a rate below this per arm; a spurious number here
+                      # is worse than none, given this project's history with a
+                      # fabricated statistic. Document, don't just pick, the floor.
+
+
+def _pair_key(rec):
+    s = (rec.get("self") or {}).get("worktree")
+    p = (rec.get("peer") or {}).get("worktree")
+    if not s or not p:
+        return None
+    return tuple(sorted((s, p)))
+
+
+def _finding_kind(rec):
+    """-> 'textual' | 'semantic' for a record that carries a finding_id.
+    Textual: verdict == 'conflict' (check or verify, `conflict_paths` is
+    what named the finding). Semantic: the only other way a finding_id gets
+    set is verify's clean-but-broken-merge case (`semantic.new_breakage`).
+    """
+    return "textual" if rec.get("verdict") == "conflict" else "semantic"
+
+
+def _study_metrics(records):
+    """-> {finding_id: {...}} - one entry per distinct finding_id seen across
+    every record, built purely by grouping/re-scanning; nothing here is
+    accumulated across calls or persisted.
+    """
+    finding_records = {}
+    pair_records = {}
+    for r in records:
+        pk = _pair_key(r)
+        if pk:
+            pair_records.setdefault(pk, []).append(r)
+        fid = r.get("finding_id")
+        if fid:
+            finding_records.setdefault(fid, []).append(r)
+
+    # The most recent record observed for each worktree pair, regardless of
+    # which finding_id (or none) it carries - this is what answers "is a
+    # given finding still live", by comparing its id against whatever the
+    # pair's latest check actually saw.
+    latest_by_pair = {}
+    for pk, rs in pair_records.items():
+        latest_by_pair[pk] = max(rs, key=lambda r: (r.get("ts") or "", r.get("check_id") or ""))
+
+    meta = {}
+    for fid, rs in finding_records.items():
+        rs_sorted = sorted(rs, key=lambda r: (r.get("ts") or "", r.get("check_id") or ""))
+        first_rec, last_rec = rs_sorted[0], rs_sorted[-1]
+        latest_pair_rec = latest_by_pair.get(_pair_key(last_rec))
+        live = bool(latest_pair_rec is not None and latest_pair_rec.get("finding_id") == fid)
+
+        self_agent = (last_rec.get("self") or {}).get("agent_id")
+        peer_agent = (last_rec.get("peer") or {}).get("agent_id")
+        if self_agent is None or peer_agent is None:
+            agent_bucket = "unknown"
+        elif self_agent == peer_agent:
+            agent_bucket = "same_agent"
+        else:
+            agent_bucket = "cross_agent"
+
+        meta[fid] = {
+            "finding_id": fid,
+            "first_seen": first_rec.get("ts"),
+            "last_seen": last_rec.get("ts"),
+            "times_seen": len(rs),
+            "distinct_checks": len(set(r.get("check_id") for r in rs)),
+            "live": live,
+            # deterministic on finding_id+salt (see is_surfaced) so this should
+            # never actually disagree across records/sides for one finding_id,
+            # unless MOIRE_SURFACE_RATE/SALT changed mid-study - if it did, go with
+            # whatever the most recent observation saw.
+            "surfaced": bool(last_rec.get("surfaced", True)),
+            "agent_bucket": agent_bucket,
+            "kind": _finding_kind(last_rec),
+        }
+    return meta
+
+
+def _median(values):
+    if not values:
+        return None
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    if n % 2:
+        return float(s[mid])
+    return (s[mid - 1] + s[mid]) / 2.0
+
+
+def _arm_summary(fids, meta):
+    """-> stats for one arm/bucket of finding_ids. Count is always reported;
+    the derived rates (median times_seen as a persistence proxy, share that
+    stopped recurring) are withheld below STUDY_MIN_N in favour of an
+    explicit "insufficient data" message - see the module note above.
+    """
+    n = len(fids)
+    if n < STUDY_MIN_N:
+        return {"n": n, "insufficient_data":
+                "insufficient data (n=%d, need >=%d)" % (n, STUDY_MIN_N)}
+    times = [meta[f]["times_seen"] for f in fids]
+    stopped = sum(1 for f in fids if not meta[f]["live"])
+    return {
+        "n": n,
+        "median_times_seen": _median(times),
+        "share_stopped_recurring": stopped / float(n),
+    }
+
+
+def _report_study(records, as_json):
+    meta = _study_metrics(records)
+    fids = list(meta.keys())
+
+    lifecycle = [meta[f] for f in
+                 sorted(fids, key=lambda f: meta[f]["times_seen"], reverse=True)][:20]
+
+    surfaced_fids = [f for f in fids if meta[f]["surfaced"]]
+    suppressed_fids = [f for f in fids if not meta[f]["surfaced"]]
+    cross_fids = [f for f in fids if meta[f]["agent_bucket"] == "cross_agent"]
+    same_fids = [f for f in fids if meta[f]["agent_bucket"] == "same_agent"]
+    unknown_fids = [f for f in fids if meta[f]["agent_bucket"] == "unknown"]
+    textual_fids = [f for f in fids if meta[f]["kind"] == "textual"]
+    semantic_fids = [f for f in fids if meta[f]["kind"] == "semantic"]
+
+    study = {
+        "distinct_findings": len(fids),
+        "min_n_per_arm": STUDY_MIN_N,
+        "lifecycle_top20_by_times_seen": lifecycle,
+        "arms": {
+            "surfaced": _arm_summary(surfaced_fids, meta),
+            "suppressed": _arm_summary(suppressed_fids, meta),
+            "caveat": "observational, not causal: surfaced vs suppressed is a random split of "
+                      "which findings were SHOWN, not a controlled trial of an intervention on "
+                      "agent behaviour - a difference here is a hypothesis, not a conclusion.",
+        },
+        "agent_split": {
+            "cross_agent": _arm_summary(cross_fids, meta),
+            "same_agent": _arm_summary(same_fids, meta),
+            "unknown": _arm_summary(unknown_fids, meta),
+        },
+        "kind_split": {
+            "textual": _arm_summary(textual_fids, meta),
+            "semantic": _arm_summary(semantic_fids, meta),
+        },
+    }
+
+    if as_json:
+        sys.stdout.write(json.dumps(study, indent=2) + "\n")
+        return 0
+
+    sys.stdout.write("distinct findings           : %d\n" % study["distinct_findings"])
+    sys.stdout.write("\nlifecycle (top 20 by times_seen):\n")
+    if not lifecycle:
+        sys.stdout.write("  (none)\n")
+    for m in lifecycle:
+        sys.stdout.write("  %s  seen=%-4d checks=%-3d first=%s last=%s live=%s\n" % (
+            m["finding_id"], m["times_seen"], m["distinct_checks"],
+            m["first_seen"], m["last_seen"], m["live"]))
+
+    def _print_arm(label, summary):
+        if "insufficient_data" in summary:
+            sys.stdout.write("  %-12s: %s\n" % (label, summary["insufficient_data"]))
+        else:
+            sys.stdout.write("  %-12s: n=%-4d median_times_seen=%-6.1f stopped_recurring=%.1f%%\n" % (
+                label, summary["n"], summary["median_times_seen"],
+                100.0 * summary["share_stopped_recurring"]))
+
+    sys.stdout.write("\narm comparison - surfaced vs suppressed (OBSERVATIONAL, NOT CAUSAL):\n")
+    _print_arm("surfaced", study["arms"]["surfaced"])
+    _print_arm("suppressed", study["arms"]["suppressed"])
+
+    sys.stdout.write("\ncross-agent vs same-agent (agent_id is a label; never affects verdicts):\n")
+    _print_arm("cross-agent", study["agent_split"]["cross_agent"])
+    _print_arm("same-agent", study["agent_split"]["same_agent"])
+    _print_arm("unknown", study["agent_split"]["unknown"])
+
+    sys.stdout.write("\ntextual vs semantic:\n")
+    _print_arm("textual", study["kind_split"]["textual"])
+    _print_arm("semantic", study["kind_split"]["semantic"])
+
+    return 0
+
+
+def cmd_report(git, argv):
+    as_json = "--json" in argv
+    study = "--study" in argv
+    cwd = os.getcwd()
+    cd = common_dir(git, cwd) if git.path else None
+    if not cd:
+        sys.stderr.write("moire: not inside a git worktree\n")
+        return 2
+    ld = log_dir(cd)
+    records, checks = _read_log_records(ld)
+
+    if study:
+        return _report_study(records, as_json)
+
+    pairs = [r for r in records if r.get("verdict") in ("clean", "conflict")]
+    conflicts = [r for r in pairs if r["verdict"] == "conflict"]
+    errors = [r for r in records if r.get("verdict") == "error"]
+    peers = set(r["peer"]["worktree"] for r in records if r.get("peer"))
+    with_peer = set(r["check_id"] for r in records)
+    paths = {}
+    for r in conflicts:
+        for p in r.get("conflict_paths", []):
+            paths[p] = paths.get(p, 0) + 1
+    top_paths = sorted(paths.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+    base_rate = (float(len(conflicts)) / len(pairs)) if pairs else None
+
+    if as_json:
+        sys.stdout.write(json.dumps({
+            "checks": checks, "checks_with_peers": len(with_peer),
+            "peer_pairs_evaluated": len(pairs), "conflicts": len(conflicts),
+            "errors": len(errors), "distinct_peers": len(peers),
+            "base_rate": base_rate, "top_paths": top_paths,
+        }, indent=2) + "\n")
+        return 0
+
+    sys.stdout.write("checks run                 : %d\n" % checks)
+    sys.stdout.write("checks with >=1 peer       : %d\n" % len(with_peer))
+    sys.stdout.write("distinct peers seen        : %d\n" % len(peers))
+    sys.stdout.write("peer-pairs evaluated       : %d\n" % len(pairs))
+    sys.stdout.write("conflicting pairs          : %d\n" % len(conflicts))
+    sys.stdout.write("errors                     : %d\n" % len(errors))
+    if base_rate is None:
+        sys.stdout.write("base rate                  : n/a (no pairs evaluated)\n")
+    else:
+        sys.stdout.write("base rate                  : %.1f%%\n" % (100.0 * base_rate))
+    if top_paths:
+        sys.stdout.write("\ntop contested paths:\n")
+        for p, n in top_paths:
+            sys.stdout.write("  %4d  %s\n" % (n, p))
+    return 0
+
+
+USAGE = """\
+moire - observed-diff conflict detection between concurrent git worktrees
+
+  moire check [--json] [--peers a,b]   would my worktree conflict with each peer, right now?
+  moire verify [--json] [--peers a,b] [--checker <cmd>]
+                                    exact semantic check on the merge-tree already produced:
+                                    would landing together break something, even textually clean?
+  moire explain <finding_id> <text...> file a display-only note against a finding id (never gates a verdict)
+  moire doctor                         verify git version, hooks, install, state dir
+  moire install [--print-client-hooks] install git hooks into $GIT_COMMON_DIR/hooks/
+  moire report [--json]                base rate and contested paths from the log
+  moire report --study [--json]        lifecycle, surfaced-vs-suppressed, cross/same-agent and
+                                    textual-vs-semantic splits over accumulated log shards
+
+Env vars:
+  MOIRE_SURFACE_RATE   float, default 1.0 - fraction of findings actually shown to the agent
+                    (the rest are still logged in full; deterministic per finding_id)
+  MOIRE_SURFACE_SALT   string, default "" - change to re-randomise the surfaced/suppressed
+                    split for a new study window
+  MOIRE_AGENT_ID       string, default unset - a label recorded alongside each check/verify
+                    record for cross-agent vs same-agent analysis; never affects a verdict
+
+Warn-only by design: `check` and `verify` always exit 0. Requires git >= 2.38.
+"""
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        sys.stdout.write(USAGE)
+        return 0
+    gitpath, ver = find_git()
+    git = Git(gitpath, ver)
+    cmd = argv[1]
+    rest = argv[2:]
+    if cmd == "check":
+        return cmd_check(git, rest)
+    if cmd == "verify":
+        return cmd_verify(git, rest)
+    if cmd == "explain":
+        return cmd_explain(git, rest)
+    if cmd == "doctor":
+        return cmd_doctor(git, rest)
+    if cmd == "install":
+        return cmd_install(git, rest)
+    if cmd == "report":
+        return cmd_report(git, rest)
+    sys.stderr.write("moire: unknown command %r\n\n%s" % (cmd, USAGE))
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

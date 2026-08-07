@@ -1,0 +1,22 @@
+# moire's own state lives inside .git/moire/ and is never committed by
+# construction. These are the usual local strays.
+
+__pycache__/
+*.py[cod]
+.DS_Store
+*.swp
+*~
+
+# client-local agent config: contains absolute, clone-specific paths
+.claude/settings.local.json
+.cursor/hooks.json
+.codex/hooks.json
+
+# Working research, design history and review material — kept locally, not published.
+/BRIEF-FOR-REVIEW.md
+/design-premise.md
+/designs/
+/spec/
+/research/
+/scope-ledger-spec.md
+/swarm-coordination-architecture.md
