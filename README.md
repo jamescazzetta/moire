@@ -129,23 +129,43 @@ locates a Python 3.8+ interpreter and gives a clear message if none is present. 
 tool itself has no dependencies of any kind.
 
 ```bash
-# one worktree per agent
-git worktree add ../repo-agent-a -b feat/a
-git worktree add ../repo-agent-b -b feat/b
+# create N worktrees, install the binary and git hooks, place the skill, verify
+moire init-swarm --agents 3
 
-# install — ONCE PER CLONE, not per worktree
-/path/to/moire install
-
-# see the hook snippet for your agent client
-/path/to/moire install --print-client-hooks
-
-# verify everything is wired
-/path/to/moire doctor
+# merge the hook into your agent client's settings (prints a diff first)
+moire wire-client claude --scope user
+moire wire-client claude --scope user --apply
 ```
 
-`moire install` puts the binary and git hooks inside `.git/`, which is shared by every worktree — so one install covers all of them, including worktrees you create later. Nothing executable is written into your working tree, and `core.hooksPath` is never touched.
+`init-swarm` is idempotent and `--dry-run` shows exactly what it would create.
+It sets up worktrees and wires the tool — it does **not** decide what each agent
+works on. Partitioning work across agents is a different and much harder problem,
+and deliberately out of scope.
 
-For **Claude Code**, add this to `~/.claude/settings.json` (or a per-worktree `.claude/settings.local.json`):
+`wire-client` prints a unified diff and writes nothing until you pass `--apply`.
+It preserves hooks you already have, keeps a `.moire-backup`, refuses to touch a
+file it cannot parse, and reports "already wired" on a second run. That config
+makes `moire` run on every agent tool use, so it is treated as a change worth
+showing you before it happens.
+
+<details>
+<summary>Doing it by hand instead</summary>
+
+```bash
+git worktree add ../repo-agent-a -b feat/a
+git worktree add ../repo-agent-b -b feat/b
+moire install                          # binary + git hooks into .git/
+moire install --print-client-hooks     # snippet to paste
+moire doctor                           # verify
+```
+
+`moire install` puts the binary and git hooks inside `.git/`, which is shared by
+every worktree — so one install covers all of them, including worktrees you create
+later. Nothing executable is written into your working tree, and `core.hooksPath`
+is never touched.
+
+For **Claude Code**, the snippet goes in `~/.claude/settings.json` (or a
+per-worktree `.claude/settings.local.json`):
 
 ```json
 {
@@ -158,18 +178,11 @@ For **Claude Code**, add this to `~/.claude/settings.json` (or a per-worktree `.
 }
 ```
 
-Two things to know about that snippet:
+The `command` path is absolute and specific to your clone. Putting it in
+`~/.claude/settings.json` keeps it out of the repository; if you prefer the in-repo
+`.claude/settings.local.json`, add that file to your `.gitignore`.
 
-- **The `command` path is absolute and specific to your clone.** Putting it in
-  `~/.claude/settings.json` keeps it out of the repository entirely, which is the
-  simplest option. If you prefer the in-repo `.claude/settings.local.json`, add that
-  file to your `.gitignore` — committed, it would point at a path that exists only on
-  your machine.
-- **`moire install --print-client-hooks` prints the same snippet for Codex CLI, Cursor
-  and OpenCode**, with the correct absolute path already filled in, so you can paste
-  rather than hand-edit.
-
-`moire` never writes to your client settings. It prints; you paste.
+</details>
 
 **Optional but recommended:** copy `skills/moire/` into `.claude/skills/` (or
 `.agents/skills/`, which Codex CLI, Cursor and OpenCode also read). It teaches the
@@ -188,6 +201,8 @@ ConE, above, a comment nobody measured.
 | `moire doctor` | Check git version, hook wiring, install state |
 | `moire report` | Conflict base rate and most-contested paths |
 | `moire report --study` | Per-finding lifecycle and A/B arm comparison |
+| `moire init-swarm` | Create N worktrees, install, place the skill, verify |
+| `moire wire-client` | Merge the hook into a client's settings (diff, then `--apply`) |
 
 Both `check` and `verify` **always exit 0**. They warn; they never fail your build.
 
@@ -211,7 +226,7 @@ The default checker is a small Python import resolver with no dependencies. `--c
 
 ## Status — read this before adopting
 
-**The mechanism works and is tested.** 40 tests across three suites, all passing, including a negative-control run proving the suite can actually fail.
+**The mechanism works and is tested.** 54 tests across four suites, all passing, including a negative-control run proving the suite can actually fail.
 
 **Whether the problem is frequent enough to be worth solving is genuinely unknown.** In 2,347 real merges from six well-known open-source projects, the silent-semantic-breakage case that `moire verify` targets occurred **zero times**. Humans avoid it socially — issue claiming, standups, "I'm taking that module." AI agents dispatched in parallel have no such process, which is the whole premise of this tool. **That premise has never been measured.**
 
@@ -225,6 +240,7 @@ The kill criterion, stated before the data arrives: **if semantic breakage stays
 bash tests/test_oracle.sh    # 12 cases: conflict detection vs real `git merge`
 bash tests/test_install.sh   # 16 cases: install, hooks, path resolution, concurrency
 bash tests/test_study.sh     # 12 cases: finding IDs, randomised suppression, agent identity
+bash tests/test_setup.sh     # 14 cases: init-swarm, wire-client, HOME containment
 ```
 
 Every suite verifies against independent ground truth and has been shown to fail when the implementation is stubbed out. A test suite that cannot fail is worse than none.
@@ -235,7 +251,7 @@ Every suite verifies against independent ground truth and has been shown to fail
 bin/moire        the tool — a single file, Python 3.8, standard library only
 bin/moire.js     Node launcher, used only by the npm distribution
 skills/moire/    an Agent Skill teaching agents how to act on a finding
-tests/           40 tests across three suites
+tests/           54 tests across four suites
 package.json     npm packaging
 README.md        this file
 LICENSE          MIT

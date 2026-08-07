@@ -20,6 +20,7 @@ Python 3.8 compatible, stdlib only.
 """
 
 import ast
+import difflib
 import hashlib
 import json
 import os
@@ -1562,6 +1563,428 @@ def cmd_install(git, argv):
     return 0
 
 
+# --------------------------------------------------------------- wire-client
+#
+# `wire-client` writes into a file that makes an AI coding client execute
+# `moire check` on every tool use - that is security-relevant, so every write
+# is: byte-exact-diffed before it happens, gated behind an explicit --apply,
+# atomic (temp file + os.replace), and backed up when it overwrites something
+# that already existed. Malformed JSON is never rewritten, only reported.
+# Shapes below are exactly CLIENT_HOOKS above, never invented fresh.
+
+CLIENT_SPECS = {
+    "claude": {"hooks_key": "hooks", "event_key": "PostToolUse"},
+    "codex": {"hooks_key": "hooks", "event_key": "PostToolUse"},
+    "cursor": {"hooks_key": "hooks", "event_key": "postToolUse"},
+}
+
+
+def _moire_json_entry(client, dest):
+    """-> the hook-array entry for `client`, in the exact shape CLIENT_HOOKS
+    prints for `moire install --print-client-hooks`. Never invent a new one.
+    """
+    if client == "claude":
+        return {"matcher": "Edit|Write|MultiEdit|Bash",
+                "hooks": [{"type": "command", "command": "%s check" % dest}]}
+    if client == "codex":
+        return {"matcher": "*", "command": [dest, "check"]}
+    if client == "cursor":
+        return {"command": "%s check" % dest}
+    raise ValueError("unknown client %r" % client)
+
+
+def _find_hook_array_target(client, data):
+    """-> (container_dict, key) where this client's hook array already lives,
+    or should be created. Prefers a key that is ALREADY there - checking the
+    flat top-level name before the canonical `hooks.<Event>` nesting - so an
+    existing file's structure is extended, never relocated. Only when
+    neither is present do we create the canonical nested location.
+    """
+    spec = CLIENT_SPECS[client]
+    hkey, ekey = spec["hooks_key"], spec["event_key"]
+    if ekey in data:
+        return data, ekey
+    hooks = data.get(hkey)
+    if isinstance(hooks, dict) and ekey in hooks:
+        return hooks, ekey
+    hooks = data.setdefault(hkey, {})
+    if not isinstance(hooks, dict):
+        raise ValueError("%r is not an object in this file" % hkey)
+    return hooks, ekey
+
+
+def _plan_json_wire(client, data, dest):
+    """Mutate `data` in place to add this clone's hook entry. -> True if a
+    moire entry for `dest` was ALREADY present (data left untouched from the
+    caller's perspective - nothing new was appended), False if `data` was
+    just extended. A pre-existing non-list value at the target key is kept
+    as the array's first element, never dropped.
+    """
+    container, key = _find_hook_array_target(client, data)
+    val = container.get(key)
+    if val is None:
+        arr = []
+        container[key] = arr
+    elif isinstance(val, list):
+        arr = val
+    else:
+        arr = [val]
+        container[key] = arr
+    for entry in arr:
+        if dest in json.dumps(entry):
+            return True
+    arr.append(_moire_json_entry(client, dest))
+    return False
+
+
+def _wire_target_path(client, scope, top):
+    home = os.path.expanduser("~")
+    if client == "claude":
+        return (os.path.join(home, ".claude", "settings.json") if scope == "user"
+                else os.path.join(top, ".claude", "settings.local.json"))
+    if client == "codex":
+        return (os.path.join(home, ".codex", "hooks.json") if scope == "user"
+                else os.path.join(top, ".codex", "hooks.json"))
+    if client == "cursor":
+        return (os.path.join(home, ".cursor", "hooks.json") if scope == "user"
+                else os.path.join(top, ".cursor", "hooks.json"))
+    if client == "opencode":
+        return os.path.join(top, ".opencode", "plugins", "moire.ts")
+    raise ValueError("unknown client %r" % client)
+
+
+def _atomic_write_text(path, text):
+    """Temp file in the SAME directory + os.replace - the write is atomic
+    even if the process dies mid-write, so a reader (a client parsing this
+    file to decide what to execute) never observes a half-written file.
+    """
+    d = os.path.dirname(path) or "."
+    try:
+        os.makedirs(d)
+    except OSError:
+        pass
+    fd, tmp = tempfile.mkstemp(prefix=".moire-wire-", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _opencode_plugin_content(dest):
+    return ('export default { "tool.execute.after": async () => {\n'
+            '  await Bun.$`%s check`; } }\n' % dest)
+
+
+def _wire_opencode(path, dest, apply_):
+    """opencode's hook is a TypeScript plugin, not JSON. There is no merge:
+    create it if absent, and if it already exists leave it alone completely
+    - moire never attempts to parse or rewrite TS.
+    """
+    content = _opencode_plugin_content(dest)
+    if os.path.exists(path):
+        sys.stdout.write(
+            "%s already exists. opencode plugins are TypeScript, not JSON - "
+            "moire never merges them; leaving it untouched. Add this snippet "
+            "yourself if it is not already there:\n\n%s" % (path, content))
+        return 0
+    if not apply_:
+        sys.stdout.write("Would create %s:\n\n%s\n" % (path, content))
+        sys.stdout.write("Nothing written. Re-run with --apply to write this file.\n")
+        return 0
+    _atomic_write_text(path, content)
+    sys.stdout.write("wrote: %s\n" % path)
+    return 0
+
+
+def _wire_json_client(client, path, dest, apply_):
+    exists = os.path.exists(path)
+    raw = ""
+    if exists:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read()
+        except OSError as ex:
+            sys.stderr.write("moire: cannot read %s: %s\n" % (path, ex))
+            return 1
+        try:
+            data = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError as ex:
+            # Never rewrite a file we could not parse.
+            sys.stderr.write(
+                "moire: %s is not valid JSON, aborting - no changes made: %s\n" % (path, ex))
+            return 1
+    else:
+        data = {}
+
+    try:
+        already = _plan_json_wire(client, data, dest)
+    except ValueError as ex:
+        sys.stderr.write("moire: %s: %s\n" % (path, ex))
+        return 1
+
+    if already:
+        sys.stdout.write("already wired: %s\n" % path)
+        return 0
+
+    new_text = json.dumps(data, indent=2) + "\n"
+
+    if not apply_:
+        diff = difflib.unified_diff(
+            raw.splitlines(keepends=True),
+            new_text.splitlines(keepends=True),
+            fromfile=path if exists else "/dev/null",
+            tofile=path)
+        sys.stdout.writelines(diff)
+        sys.stdout.write("\nNothing written. Re-run with --apply to write this file.\n")
+        return 0
+
+    backup = None
+    if exists:
+        backup = path + ".moire-backup"
+        shutil.copyfile(path, backup)
+    _atomic_write_text(path, new_text)
+    sys.stdout.write("wrote: %s\n" % path)
+    if backup:
+        sys.stdout.write("backup: %s\n" % backup)
+    return 0
+
+
+def cmd_wire_client(git, argv):
+    usage = ("moire: usage: moire wire-client <claude|codex|cursor|opencode> "
+             "[--scope user|project] [--apply]\n")
+    if not argv or argv[0] in ("-h", "--help"):
+        sys.stdout.write(usage)
+        return 0
+    client = argv[0]
+    if client not in ("claude", "codex", "cursor", "opencode"):
+        sys.stderr.write("moire: unknown client %r\n%s" % (client, usage))
+        return 2
+
+    scope = "project"
+    apply_ = False
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--scope" and i + 1 < len(argv):
+            scope = argv[i + 1]
+            i += 2
+            continue
+        if a == "--apply":
+            apply_ = True
+            i += 1
+            continue
+        sys.stderr.write("moire: unknown argument %r\n%s" % (a, usage))
+        return 2
+    if scope not in ("user", "project"):
+        sys.stderr.write("moire: --scope must be user or project\n" + usage)
+        return 2
+    if client == "opencode" and scope == "user":
+        sys.stderr.write("moire: opencode has no user scope - it is project-only\n")
+        return 2
+
+    if not _require_git(git):
+        return 2
+    cwd = os.getcwd()
+    top = git.out(["rev-parse", "--show-toplevel"], cwd=cwd)
+    if not top:
+        sys.stderr.write("moire: not inside a git worktree\n")
+        return 2
+    top = os.path.realpath(top)
+    cd = common_dir(git, cwd)
+    if not cd:
+        sys.stderr.write("moire: could not resolve git common dir\n")
+        return 2
+    dest = installed_bin(cd)
+    path = _wire_target_path(client, scope, top)
+
+    if client == "opencode":
+        return _wire_opencode(path, dest, apply_)
+    return _wire_json_client(client, path, dest, apply_)
+
+
+# ---------------------------------------------------------------- init-swarm
+#
+# Collapses the manual six-step procedure in the README's Install section
+# (worktrees, install, client hooks, skill, doctor) into one command.
+# HARD SCOPE LIMIT: this creates worktrees and wires the tool. It never
+# decides what an agent works on, assigns tasks, partitions files, or writes
+# a task description - work partitioning is explicitly out of scope for this
+# project (see the README's account of what was tried and thrown away).
+
+def _parse_init_swarm_args(argv):
+    agents = None
+    prefix = "agent"
+    skills_mode = "user"
+    dry_run = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--agents" and i + 1 < len(argv):
+            agents = argv[i + 1]
+            i += 2
+            continue
+        if a == "--prefix" and i + 1 < len(argv):
+            prefix = argv[i + 1]
+            i += 2
+            continue
+        if a == "--skills" and i + 1 < len(argv):
+            skills_mode = argv[i + 1]
+            i += 2
+            continue
+        if a == "--dry-run":
+            dry_run = True
+            i += 1
+            continue
+        raise ValueError("unknown argument %r" % a)
+    if agents is None:
+        raise ValueError("--agents N is required")
+    try:
+        agents = int(agents)
+    except ValueError:
+        raise ValueError("--agents must be an integer")
+    if agents < 1:
+        raise ValueError("--agents must be >= 1")
+    if skills_mode not in ("user", "project", "none"):
+        raise ValueError("--skills must be one of user|project|none")
+    if not prefix or any(c in prefix for c in "/\\ \t\n"):
+        raise ValueError("--prefix must not contain whitespace or path separators")
+    return agents, prefix, skills_mode, dry_run
+
+
+def cmd_init_swarm(git, argv):
+    usage = ("moire: usage: moire init-swarm --agents N [--prefix agent] "
+             "[--skills user|project|none] [--dry-run]\n")
+    try:
+        n, prefix, skills_mode, dry_run = _parse_init_swarm_args(argv)
+    except ValueError as ex:
+        sys.stderr.write("moire: %s\n%s" % (ex, usage))
+        return 2
+
+    def step(msg):
+        sys.stdout.write(msg + "\n")
+
+    ok = True
+
+    # 1. Preflight -------------------------------------------------------
+    step("== preflight ==")
+    if not _require_git(git):
+        return 1
+    cwd = os.getcwd()
+    top = git.out(["rev-parse", "--show-toplevel"], cwd=cwd)
+    if not top:
+        sys.stderr.write("moire: not inside a git worktree\n")
+        return 1
+    top = os.path.realpath(top)
+    step("  git %s at %s: ok" % (git.version_str, git.path))
+    step("  inside a git worktree: %s" % top)
+    head = git.out(["rev-parse", "HEAD"], cwd=top)
+    if not head:
+        sys.stderr.write("moire: repo has no commits yet - create an initial commit first\n")
+        return 1
+    step("  repo has a commit: ok (%s)" % head[:12])
+    cd = common_dir(git, top)
+    if not cd:
+        sys.stderr.write("moire: could not resolve git common dir\n")
+        return 1
+
+    # 2. Worktrees ---------------------------------------------------------
+    step("== worktrees ==")
+    parent = os.path.dirname(top)
+    repo_name = os.path.basename(top)
+    for i in range(1, n + 1):
+        branch = "%s-%d" % (prefix, i)
+        path = os.path.join(parent, "%s-%s-%d" % (repo_name, prefix, i))
+        if os.path.isdir(path):
+            step("  skip (exists): %s" % path)
+            continue
+        if dry_run:
+            step("  [dry-run] would create worktree %s (branch %s)" % (path, branch))
+            continue
+        branch_exists = git.out(["rev-parse", "--verify", "--quiet",
+                                 "refs/heads/%s" % branch], cwd=top) is not None
+        args = ["worktree", "add"]
+        args += [path, branch] if branch_exists else ["-b", branch, path]
+        rc, out, err = git(args, cwd=top)
+        if rc != 0:
+            sys.stderr.write("  FAIL: worktree add %s: %s\n" % (path, (err or out).strip()))
+            ok = False
+            continue
+        step("  created: %s (branch %s)" % (path, branch))
+
+    # 3. Install -- reuses cmd_install() verbatim, never duplicated --------
+    step("== install ==")
+    if dry_run:
+        dest = installed_bin(cd)
+        step("  [dry-run] would install binary to %s" % dest)
+        for h in HOOKS:
+            step("  [dry-run] would install hook %s" % os.path.join(cd, "hooks", h))
+    else:
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(top)
+            rc = cmd_install(git, [])
+        finally:
+            os.chdir(old_cwd)
+        if rc != 0:
+            ok = False
+
+    # 4. Skills --------------------------------------------------------
+    step("== skills ==")
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    src_skills = os.path.normpath(os.path.join(script_dir, "..", "skills", "moire"))
+    if skills_mode == "none":
+        step("  --skills none: skipping")
+    elif not os.path.isdir(src_skills):
+        # Installs from npm ship skills/; a bare checkout of just bin/moire may not.
+        step("  skills/moire/ not found next to %s: skipping" % script_dir)
+    else:
+        dests = []
+        if skills_mode == "user":
+            home = os.path.expanduser("~")
+            dests = [os.path.join(home, ".claude", "skills", "moire"),
+                     os.path.join(home, ".agents", "skills", "moire")]
+        else:  # project
+            dests = [os.path.join(top, ".claude", "skills", "moire")]
+            sys.stdout.write(
+                "  WARNING: --skills project writes into the working tree (%s) "
+                "- add it to .gitignore.\n" % dests[0])
+        for d in dests:
+            if dry_run:
+                step("  [dry-run] would copy %s -> %s" % (src_skills, d))
+            else:
+                shutil.copytree(src_skills, d, dirs_exist_ok=True)
+                step("  copied: %s" % d)
+
+    # 5. Doctor --------------------------------------------------------
+    step("== doctor ==")
+    if dry_run:
+        step("  [dry-run] would run doctor checks")
+    else:
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(top)
+            rc = cmd_doctor(git, [])
+        finally:
+            os.chdir(old_cwd)
+        if rc != 0:
+            ok = False
+
+    # 6. Next steps ------------------------------------------------------
+    step("== next steps ==")
+    prog = sys.argv[0] if sys.argv else "moire"
+    step("  Wire your AI client's hook (plan first, then --apply), e.g.:")
+    step("    %s wire-client claude --scope user --apply" % prog)
+    step("  (swap 'claude' for codex/cursor/opencode as needed)")
+
+    return 0 if ok else 1
+
+
 def _read_log_records(ld):
     """-> (records, checks): every record across every shard file in `ld`, and
     the shard (= check/verify invocation) count. Skips dotfiles (in-progress
@@ -1843,6 +2266,15 @@ moire - observed-diff conflict detection between concurrent git worktrees
   moire explain <finding_id> <text...> file a display-only note against a finding id (never gates a verdict)
   moire doctor                         verify git version, hooks, install, state dir
   moire install [--print-client-hooks] install git hooks into $GIT_COMMON_DIR/hooks/
+  moire init-swarm --agents N [--prefix agent] [--skills user|project|none] [--dry-run]
+                                    create N sibling worktrees, install the binary/hooks,
+                                    copy the agent skill, and run doctor - one command in
+                                    place of the manual Install procedure. Never assigns
+                                    tasks or partitions work - that is out of scope.
+  moire wire-client <claude|codex|cursor|opencode> [--scope user|project] [--apply]
+                                    plan (default) or write (--apply) the client hook that
+                                    runs `moire check` after every tool use. Always diffs
+                                    before writing, writes atomically, keeps a backup.
   moire report [--json]                base rate and contested paths from the log
   moire report --study [--json]        lifecycle, surfaced-vs-suppressed, cross/same-agent and
                                     textual-vs-semantic splits over accumulated log shards
@@ -1877,6 +2309,10 @@ def main(argv):
         return cmd_doctor(git, rest)
     if cmd == "install":
         return cmd_install(git, rest)
+    if cmd == "init-swarm":
+        return cmd_init_swarm(git, rest)
+    if cmd == "wire-client":
+        return cmd_wire_client(git, rest)
     if cmd == "report":
         return cmd_report(git, rest)
     sys.stderr.write("moire: unknown command %r\n\n%s" % (cmd, USAGE))
