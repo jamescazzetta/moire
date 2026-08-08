@@ -2,6 +2,9 @@
 
 **Tells parallel AI coding agents when their in-flight work would break each other — before either of them lands.**
 
+> When two agents work at once, what checks that their changes still fit together —
+> before one of them lands?
+
 ---
 
 ## The problem
@@ -63,6 +66,18 @@ Needs **git ≥ 2.38** and **Python 3.8+**. No daemon, no server, no config file
 account, and nothing written into your working tree. Uninstalling is deleting a
 directory.
 
+## Where it fits
+
+Everything below already runs somewhere in your pipeline. The gap is the last two rows.
+
+| | sees | catches |
+| --- | --- | --- |
+| `git merge` | overlapping lines | conflicts — at merge time |
+| code review | two separate diffs | nothing; each diff looks correct |
+| CI | the merged result | everything — after both have landed |
+| **`moire check`** | **both live worktrees** | **conflicts, while both are still writing** |
+| **`moire verify`** | **the merge that would result, right now** | **breakage that merges cleanly** |
+
 ## Three things that make it unusual
 
 - **It asks nobody anything.** It reads the other agent's files. The other agent needs
@@ -73,68 +88,9 @@ directory.
 
 Each of those is a reaction to something that has already been tried and measured.
 
-## What has been tried before
-
-This is a well-populated graveyard, and the failures are more instructive than the
-designs.
-
-| Approach | Example | What happened |
-| --- | --- | --- |
-| **Agents declare what they will touch**; a registry arbitrates | MCP Agent Mail, Agent Claim MCP | Advisory by their own documentation — nothing enforces a claim. The most-starred has 2,069 stars, one contributor, and ~117 downloads a month. |
-| **The same idea, enforced at write time** | [Claim Plane](https://arxiv.org/abs/2608.00947) | Measured across 360 runs. Selective admission scored **22.2%** against **23.3%** for no coordination at all — indistinguishable. **51%** of runs failed closed on scope the agent never declared. The conservative variant reached parity only by serialising **96.7%** of the work. |
-| **Let the agents talk to each other** | [CooperBench](https://arxiv.org/abs/2601.13295) | A communication channel reduced merge conflicts and **did not raise task success**, while consuming ~20% of the token budget. |
-| **Detect overlap at pull-request time** | [ConE](https://arxiv.org/abs/2101.06542) (Microsoft) | Works, at scale — 234 repositories, 26,000 PRs, 71% of notifications rated useful. Detects *file* overlap, after both branches already exist, and ships as a comment. |
-| **Warn human developers proactively** | Palantír, Crystal (FSE 2011) | Demonstrated in the lab across 550,000 versions. Fifteen years later, no industrial adoption. |
-| **Isolate, merge later** | every commercial agent orchestrator | Works, and defers the problem to a human at merge time. This is what everyone actually ships. |
-| **Partition the work before dispatch** | [Co-Coder](https://arxiv.org/abs/2606.00953) | **This one works** — 2.10× wall-clock, −35% cost, +14pp pass rate. It degrades to sequential when the repository is tightly coupled, which is precisely the gap left over. |
-
-### Why this is different
-
-The first three rows share a shape: they ask an agent to describe its own work, before
-or while it does it. That assumption is what the measurements destroyed. An agent that
-misjudges its blast radius also misdescribes it, and no amount of protocol repairs an
-unreliable input.
-
-**moire never asks.** It reads the other worktree's files. There is no declaration to
-be wrong, so there is no 51% failure mode to inherit.
-
-Three consequences follow structurally, not by effort:
-
-1. **Nothing to tune.** `check` runs git's own merge engine, so the answer *is* the
-   answer the real merge will give. No threshold, no model, no precision that degrades
-   on a repository it was not calibrated against.
-2. **It sees what nothing else does.** Git catches overlapping lines at merge time.
-   ConE catches overlapping files at PR time. Neither sees a merge that is textually
-   clean and semantically broken — the case in the example above. `verify` does,
-   because it runs a real checker against the merged tree that `merge-tree` produces
-   even when the merge succeeds.
-3. **One-sided by construction.** Every other scheme here needs both parties to
-   participate. This one protects whoever runs it, against agents that are not
-   cooperating and may be from another vendor.
-
-And it is aimed at the case partitioning cannot reach: Co-Coder's approach wins where
-a repository decomposes cleanly, and falls back to sequential where it does not.
-Tightly-coupled work is exactly where concurrent agents still collide.
-
-### What this project tried and threw away
-
-Three mechanisms were designed here and then abandoned on evidence:
-
-- **A declared-intent ledger with a model classifying whether two intents were
-  compatible** — dropped once the measurements above landed.
-- **A line-range overlap predicate.** 24.1% recall as first specified. Corrected to
-  100% recall, but precision swung from **88.4%** on one repository to **36.6%** on
-  another, because it only *approximates* git's merge condition. Replaced by asking
-  git directly.
-- **A symbol-matching heuristic** to catch the semantic case from diffs alone. Tested
-  against 2,347 concurrent branch pairs *before* implementation: 24 fires, **0 true
-  positives** —
-  every one a regex artifact, including English prose in a docstring matching a
-  definition pattern. Killed before a line was written.
-
-The tool is what survived that.
-
 ## Install
+
+The three lines above are the whole thing; this section is the detail behind them.
 
 **Requires git ≥ 2.38.** Older git silently misses whole classes of conflict
 (rename/rename, modify/delete, binary), so `moire` refuses to run rather than give you
@@ -243,6 +199,67 @@ For each peer worktree:
 The default checker is a small Python import resolver with no dependencies. `--checker 'mypy .'` or `--checker 'pytest -x'` swaps in whatever your repo already runs — so the check gets stronger for free as your own test suite does.
 
 **Cost:** ~187 ms per write with 3 peers (warm), ~335 ms cold. Peer snapshots are cached; your own is always recomputed, because a stale self-snapshot is the one error that would silently produce a wrong answer.
+
+## Why not do it another way?
+
+Several other approaches exist. Their measured outcomes are more instructive than the
+designs, and they are why moire is shaped the way it is.
+
+| Approach | Example | What happened |
+| --- | --- | --- |
+| **Agents declare what they will touch**; a registry arbitrates | MCP Agent Mail, Agent Claim MCP | Advisory by their own documentation — nothing enforces a claim. The most-starred has 2,069 stars, one contributor, and ~117 downloads a month. |
+| **The same idea, enforced at write time** | [Claim Plane](https://arxiv.org/abs/2608.00947) | Measured across 360 runs. Selective admission scored **22.2%** against **23.3%** for no coordination at all — indistinguishable. **51%** of runs failed closed on scope the agent never declared. The conservative variant reached parity only by serialising **96.7%** of the work. |
+| **Let the agents talk to each other** | [CooperBench](https://arxiv.org/abs/2601.13295) | A communication channel reduced merge conflicts and **did not raise task success**, while consuming ~20% of the token budget. |
+| **Detect overlap at pull-request time** | [ConE](https://arxiv.org/abs/2101.06542) (Microsoft) | Works, at scale — 234 repositories, 26,000 PRs, 71% of notifications rated useful. Detects *file* overlap, after both branches already exist, and ships as a comment. |
+| **Warn human developers proactively** | Palantír, Crystal (FSE 2011) | Demonstrated in the lab across 550,000 versions. Fifteen years later, no industrial adoption. |
+| **Isolate, merge later** | every commercial agent orchestrator | Works, and defers the problem to a human at merge time. This is what everyone actually ships. |
+| **Partition the work before dispatch** | [Co-Coder](https://arxiv.org/abs/2606.00953) | **This one works** — 2.10× wall-clock, −35% cost, +14pp pass rate. It degrades to sequential when the repository is tightly coupled, which is precisely the gap left over. |
+
+### Why this is different
+
+The first three rows share a shape: they ask an agent to describe its own work, before
+or while it does it. That assumption is what the measurements destroyed. An agent that
+misjudges its blast radius also misdescribes it, and no amount of protocol repairs an
+unreliable input.
+
+**moire never asks.** It reads the other worktree's files. There is no declaration to
+be wrong, so there is no 51% failure mode to inherit.
+
+Three consequences follow structurally, not by effort:
+
+1. **Nothing to tune.** `check` runs git's own merge engine, so the answer *is* the
+   answer the real merge will give. No threshold, no model, no precision that degrades
+   on a repository it was not calibrated against.
+2. **It sees what nothing else does.** Git catches overlapping lines at merge time.
+   ConE catches overlapping files at PR time. Neither sees a merge that is textually
+   clean and semantically broken — the case in the example above. `verify` does,
+   because it runs a real checker against the merged tree that `merge-tree` produces
+   even when the merge succeeds.
+3. **One-sided by construction.** Every other scheme here needs both parties to
+   participate. This one protects whoever runs it, against agents that are not
+   cooperating and may be from another vendor.
+
+And it is aimed at the case partitioning cannot reach: Co-Coder's approach wins where
+a repository decomposes cleanly, and falls back to sequential where it does not.
+Tightly-coupled work is exactly where concurrent agents still collide.
+
+### What this project tried and threw away
+
+Three mechanisms were designed here and then abandoned on evidence:
+
+- **A declared-intent ledger with a model classifying whether two intents were
+  compatible** — dropped once the measurements above landed.
+- **A line-range overlap predicate.** 24.1% recall as first specified. Corrected to
+  100% recall, but precision swung from **88.4%** on one repository to **36.6%** on
+  another, because it only *approximates* git's merge condition. Replaced by asking
+  git directly.
+- **A symbol-matching heuristic** to catch the semantic case from diffs alone. Tested
+  against 2,347 concurrent branch pairs *before* implementation: 24 fires, **0 true
+  positives** —
+  every one a regex artifact, including English prose in a docstring matching a
+  definition pattern. Killed before a line was written.
+
+The tool is what survived that.
 
 ## Status — read this before adopting
 
