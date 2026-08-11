@@ -692,6 +692,107 @@ test_016() {
 	rm -rf "$tmpdir"
 }
 
+# TEST 17: re-checking an unchanged worktree writes no new git objects
+#
+# `SNAPSHOT_ENV` pins author/committer DATES as well as identity, so a snapshot
+# commit is a pure function of (tree, parent) and re-observing an unchanged
+# worktree re-derives oids that are already in the object store. Without the
+# pinned dates, `commit-tree` stamps wall-clock time at 1-second resolution and
+# an idle repo under a per-write hook grows by ~1 object per second forever.
+#
+# The `sleep 2` is load-bearing twice over: it crosses a wall-clock second (the
+# resolution of the timestamp whose removal is being asserted -- a same-second
+# re-check would pass even with the regression back in place) AND the default
+# 2s peer-snapshot cache TTL, so check 2 genuinely re-snapshots BOTH sides
+# rather than replaying the peer's cached oids.
+test_017() {
+	local tmpdir=$(setup_test_repo)
+	TEMP_DIRS+=("$tmpdir")
+	cd "$tmpdir"
+
+	# HEAD rather than a branch name: setup_test_repo inherits whatever
+	# init.defaultBranch is configured on the host, so naming "main" here
+	# would couple this case to the tester's git config.
+	if ! "$MOIRE_GIT" worktree add -b moire-idem-peer peer-wt HEAD >/dev/null 2>&1; then
+		log_test 017 SKIP "git worktree not available"
+		rm -rf "$tmpdir"
+		return
+	fi
+
+	# Give the peer a state of its own, so check 1 has genuinely new content
+	# to write and the delta measured below is not trivially zero on a pair
+	# of byte-identical worktrees.
+	echo "peer only" > peer-wt/peer_only.txt
+
+	# Check 1 writes the snapshot objects for both states.
+	"$MOIRE_BIN" check > /dev/null 2>&1
+	local before
+	before=$(loose_object_count)
+
+	sleep 2
+
+	# Check 2 observes the identical pair of states: it must write nothing.
+	"$MOIRE_BIN" check > /dev/null 2>&1
+	local after
+	after=$(loose_object_count)
+
+	if [[ -z "$before" || -z "$after" ]]; then
+		log_test 017 FAIL "could not read loose object count (before=$before after=$after)"
+	elif [[ "$after" -eq "$before" ]]; then
+		log_test 017 PASS "re-check of an unchanged worktree writes no objects ($before unchanged)"
+	else
+		log_test 017 FAIL "re-check grew .git/objects by $((after - before)) (before=$before after=$after)"
+	fi
+
+	rm -rf "$tmpdir"
+}
+
+# TEST 18: snapshot tree AND commit oids are stable across checks
+#
+# The direct form of what test_017 measures indirectly: not merely "no new
+# objects" but "the same oids". Guards the case where a future change writes
+# the same COUNT of objects while still deriving fresh oids (e.g. re-pinning
+# the date to something per-process rather than per-second).
+test_018() {
+	local tmpdir=$(setup_test_repo)
+	TEMP_DIRS+=("$tmpdir")
+	cd "$tmpdir"
+
+	if ! "$MOIRE_GIT" worktree add -b moire-stable-peer peer-wt HEAD >/dev/null 2>&1; then
+		log_test 018 SKIP "git worktree not available"
+		rm -rf "$tmpdir"
+		return
+	fi
+	echo "peer only" > peer-wt/peer_only.txt
+
+	local common_dir
+	common_dir=$(get_git_common_dir)
+
+	local json1 json2 map1 map2 tree1 tree2
+	json1=$("$MOIRE_BIN" check --json 2>/dev/null)
+	map1=$(snapshot_oid_map "$common_dir")
+
+	sleep 2                       # see test_017: crosses a second and the cache TTL
+
+	json2=$("$MOIRE_BIN" check --json 2>/dev/null)
+	map2=$(snapshot_oid_map "$common_dir")
+
+	tree1=$(echo "$json1" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["self"]["tree"])' 2>/dev/null)
+	tree2=$(echo "$json2" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["self"]["tree"])' 2>/dev/null)
+
+	if [[ -z "$tree1" || -z "$map1" ]]; then
+		log_test 018 FAIL "no snapshot oids observed (tree=$tree1, cache map empty)"
+	elif [[ "$tree1" != "$tree2" ]]; then
+		log_test 018 FAIL "self tree oid changed across checks: $tree1 vs $tree2"
+	elif [[ "$map1" != "$map2" ]]; then
+		log_test 018 FAIL "snapshot commit oids changed across checks: [$map1] vs [$map2]"
+	else
+		log_test 018 PASS "snapshot tree and commit oids stable across checks"
+	fi
+
+	rm -rf "$tmpdir"
+}
+
 # TEST 19: doctor reports object-store pressure against git's own gc.auto
 #
 # Observational only: a full object store is not a broken install, so the line
@@ -770,6 +871,8 @@ test_013
 test_014
 test_015
 test_016
+test_017
+test_018
 
 # doctor exercises the one operation everything depends on. check/verify are
 # warn-only: a snapshot that fails is caught, logged as verdict "error", and

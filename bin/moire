@@ -42,8 +42,30 @@ MIN_GIT = (2, 38)
 SNAPSHOT_ENV = {
     "GIT_AUTHOR_NAME": "moire", "GIT_AUTHOR_EMAIL": "moire@localhost",
     "GIT_COMMITTER_NAME": "moire", "GIT_COMMITTER_EMAIL": "moire@localhost",
+    # Fixed FUTURE date (2100-01-01T00:00:00Z in git's internal "@<epoch> <tz>"
+    # form). Pinning identity but not dates made every snapshot commit of an
+    # UNCHANGED tree a fresh OID once per wall-clock second, so an idle repo
+    # under a per-write hook grew .git/objects at ~1 object/second forever.
+    # With the dates pinned the snapshot commit is a pure function of (tree,
+    # parent): re-observing an unchanged worktree writes nothing. Measured on a
+    # 200-file lab repo with one peer worktree and MOIRE_CACHE_TTL=0: 60 idle
+    # checks used to add one object per second of ELAPSED time, not per check
+    # (+17 over 15.6s, +22 over 21.5s, +10 over 10.1s across runs); they now add
+    # 1 on the first run and exactly 0 on every run after. Latency is unchanged
+    # (median 242.5ms before / 244.2ms after, 100 interleaved checks per arm) -
+    # this buys object count, not speed.
+    #
+    # MUST be a future date, never epoch 0. git's merge-base/merge-tree walk a
+    # commit-date priority queue and stop on a date cutoff; a tip older than its
+    # own ancestors defeats that. Measured on a 100k-commit history: merge-base
+    # 503ms / merge-tree 572ms at "@0" versus 16ms / 16ms here and 16ms / 17ms
+    # for the real branch tips with no snapshot commit at all.
+    #
+    # Nothing reads these dates. compute_arbiter's rules are tree-OID equality,
+    # `diff --name-only` and `rev-list --count` - content and topology, never
+    # time - and no snapshot commit is ever named by a ref or written to a record.
+    "GIT_AUTHOR_DATE": "@4102444800 +0000", "GIT_COMMITTER_DATE": "@4102444800 +0000",
 }
-
 HOOK_MARKER = "# >>> moire hook >>>"
 HOOKS = ("post-commit", "post-merge")
 DEFAULT_CACHE_TTL = 2.0

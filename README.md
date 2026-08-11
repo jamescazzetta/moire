@@ -252,6 +252,8 @@ moire verify --checker './node_modules/.bin/tsc --noEmit | sed -E "s/\([0-9]+,[0
 
 **Cost:** ~187 ms warm, ~335 ms cold, for `check` plus a **builtin**-checker `verify` against 3 peers, measured on this repo. Peer snapshots are cached; your own is always recomputed, because a stale self-snapshot is the one error that would silently produce a wrong answer.
 
+Snapshots are content-addressed, so re-checking an unchanged worktree writes no objects at all: on a 200-file lab repo, 60 idle checks add one object the first time and none on any run after. Observing a genuinely *new* state does write objects — that is intrinsic, not overhead — and those are refless and swept by git's own housekeeping, which normal commit and fetch activity already triggers. moire never deletes an object; `moire doctor` warns if loose objects ever accumulate past git's own `gc.auto` threshold.
+
 Point `--checker` at anything real and that figure stops applying: cost becomes `snapshot overhead + K × checker runtime`, where `K = 2 × peers + 1` — self is checked once per run, peer and merged once per peer. With a checker in the seconds range, that puts `verify` past what belongs on a per-write hook: run `check` on every write, and `verify` before declaring a task done, which is what `skills/moire-parallel/SKILL.md` already instructs. `verify --json` reports its own elapsed time, so you measure your own cost instead of trusting this one.
 
 ## Why not do it another way?
@@ -317,7 +319,7 @@ The tool is what survived that.
 
 ## Status — read this before adopting
 
-**The mechanism works and is tested.** 80 tests across five suites, all passing (one skips below Python 3.12), including a negative-control run proving the suite can actually fail.
+**The mechanism works and is tested.** 81 tests across five suites, all passing (one skips below Python 3.12), including a negative-control run proving the suite can actually fail.
 
 **What is unknown is the frequency, not the existence.** The failure is real and easy to
 reproduce — case 2 of `tests/test_verify.sh` is exactly it: one agent renames a function,
@@ -343,7 +345,7 @@ detection, which stands on its own.
 
 ```bash
 bash tests/test_oracle.sh    # 12 cases: conflict detection vs real `git merge`
-bash tests/test_install.sh   # 18 cases: install, hooks, path resolution, concurrency, doctor diagnostics
+bash tests/test_install.sh   # 19 cases: install, hooks, path resolution, concurrency, object-store growth
 bash tests/test_study.sh     # 12 cases: finding IDs, randomised suppression, agent identity
 bash tests/test_setup.sh     # 14 cases: init-swarm, wire-client, HOME containment
 bash tests/test_verify.sh    # 24 cases: the semantic path — new_breakage, --link, checker coverage, report fields
@@ -358,7 +360,7 @@ bin/moire        the tool — a single file, Python 3.8, standard library only
 bin/moire.js     Node launcher, used only by the npm distribution
 skills/          two Agent Skills: one for acting on a finding, one for
                  setting up parallel work
-tests/           80 tests across five suites
+tests/           81 tests across five suites
 package.json     npm packaging
 README.md        this file
 LICENSE          MIT
