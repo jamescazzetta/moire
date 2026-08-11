@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 MIN_GIT = (2, 38)
 SNAPSHOT_ENV = {
@@ -345,9 +345,12 @@ def oracle_tree(git, cwd, commit_a, commit_b):
 
     `git merge-tree --write-tree --name-only` prints the merged tree's OID as
     stdout line 0 on BOTH a clean merge (exit 0) and a conflicted one (exit 1) --
-    on conflict the tree is written anyway with conflict markers baked in, which
-    is not a tree `verify` ever reads. Verdict still comes from the EXIT CODE
-    only, exactly like oracle(); this function only adds the OID oracle() drops.
+    on conflict the tree is written anyway with conflict markers baked in.
+    `verify` reads that conflicted tree too, when the builtin checker runs
+    under a textual conflict to catch breakage on files disjoint from it (the
+    marker-laden files are unparsable, so the checker withholds judgement on
+    them). Verdict still comes from the EXIT CODE only, exactly like oracle();
+    this function only adds the OID oracle() drops.
     """
     rc, out, err = git(["merge-tree", "--write-tree", "--name-only", commit_a, commit_b], cwd=cwd)
     lines = out.split("\n")
@@ -384,6 +387,39 @@ def materialize_tree(git, cwd, tree_oid, dest):
     if p2.returncode != 0:
         raise RuntimeError("tar extract of %s failed: %s" %
                            (tree_oid, err2.decode("utf-8", "replace").strip()))
+
+
+def link_directories(dest, source_worktree, names):
+    """Symlink user-named directories from a real worktree into a materialised
+    tree. `git archive` emits tracked files only, so a gitignored dependency
+    directory (node_modules, .venv, vendor, ...) is absent from every
+    materialised tree and a checker that needs one drowns in unresolved-module
+    noise. The user names the directory; moire knows nothing about any package
+    manager. For each name: link only if `<source_worktree>/<name>` is an
+    existing directory AND the materialised tree has nothing at that name
+    already (a tracked entry is left alone); otherwise skip silently. The
+    MERGED tree borrows SELF's worktree as its source - a deliberate
+    approximation: the merged state was never checked out anywhere, so it has
+    no dependency directory of its own, and self's is the closest stand-in.
+    The symlink is LIVE, not read-only: a checker that writes into the linked
+    directory (tsc --incremental's .tsbuildinfo, eslint --cache, anything
+    using node_modules/.cache) writes straight through into the real worktree
+    it points at - nothing here enforces read-only, because a portable
+    stdlib-only enforcement does not exist. Only link a directory whose
+    contamination by the checker is acceptable. -> list of names actually
+    linked.
+    """
+    linked = []
+    for name in names:
+        src = os.path.join(source_worktree, name)
+        tgt = os.path.join(dest, name)
+        if not os.path.isdir(src):
+            continue
+        if os.path.lexists(tgt):
+            continue                  # tracked entry materialised there: leave it alone
+        os.symlink(os.path.abspath(src), tgt)
+        linked.append(name)
+    return linked
 
 
 # ------------------------------------------------------ builtin semantic checker
@@ -711,7 +747,7 @@ def write_agent_marker(cd, worktree, agent_id):
     except OSError:
         pass
     rec = {"worktree": worktree, "agent_id": agent_id,
-           "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
+           "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     path = _agent_marker_file(cd, worktree)
     tmp = "%s.tmp-%d-%s" % (path, os.getpid(), uuid.uuid4().hex[:6])
     try:
@@ -1004,7 +1040,7 @@ def cmd_check(git, argv):
         peers = [w for w in wts if w["worktree"] != top]
 
     check_id = str(uuid.uuid4())
-    ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     records = []
     rate, salt = surface_rate(), surface_salt()
     agent_id = os.environ.get("MOIRE_AGENT_ID")     # a label only - see the module note above write_agent_marker
@@ -1086,7 +1122,7 @@ def cmd_check(git, argv):
             os.makedirs(ld)
         except OSError:
             pass
-        name = "%s-%d-%s.json" % (datetime.utcnow().strftime("%Y%m%dT%H%M%S%f"),
+        name = "%s-%d-%s.json" % (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f"),
                                   os.getpid(), uuid.uuid4().hex[:6])
         tmp = os.path.join(ld, "." + name + ".tmp")
         with open(tmp, "w") as f:
@@ -1147,6 +1183,18 @@ def cmd_verify(git, argv):
         i = argv.index("--checker")
         if i + 1 < len(argv):
             checker = argv[i + 1]
+    links = []                        # repeatable: every --link <name> occurrence
+    for i, a in enumerate(argv):
+        if a == "--link":
+            if i + 1 >= len(argv):
+                sys.stderr.write("moire: --link requires a directory name\n")
+                return 2              # refuse; write no log
+            links.append(argv[i + 1])
+    for name in links:
+        if not name or "/" in name or "\\" in name or name in (".", ".."):
+            sys.stderr.write("moire: --link %r: name must be a single path component "
+                             "(no '/', '\\', '.' or '..')\n" % name)
+            return 2                  # refuse; write no log
 
     if not _require_git(git):
         return 2                      # refuse; write no log
@@ -1183,7 +1231,7 @@ def cmd_verify(git, argv):
         peers = [w for w in wts if w["worktree"] != top]
 
     check_id = str(uuid.uuid4())
-    ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     records = []
     timeout = checker_timeout()
     rate, salt = surface_rate(), surface_salt()
@@ -1203,83 +1251,164 @@ def cmd_verify(git, argv):
     except Exception as ex:
         my_tree, my_commit, my_err = None, None, str(ex)
 
-    for p in peers:
-        t0 = time.time()
-        phead = p.get("head")
-        if phead is None and os.path.isdir(p["worktree"]):
-            phead = git.out(["rev-parse", "HEAD"], cwd=p["worktree"])
-        self_info = {"worktree": top, "branch": me.get("branch"), "head": me.get("head")}
-        peer_info = {"worktree": p["worktree"], "branch": p.get("branch"), "head": phead}
-        rec = {
-            "v": 1, "check_id": check_id, "ts": ts, "repo_common_dir": cd,
-            "self": {"worktree": top, "branch": me.get("branch"),
-                     "head": me.get("head"), "tree": my_tree, "agent_id": agent_id},
-            "peer": {"worktree": p["worktree"], "branch": p.get("branch"),
-                     "head": phead, "tree": None,
-                     "agent_id": read_agent_marker(cd, p["worktree"]) if cd else None},
-            "verdict": "error", "conflict_paths": [],
-            "git_version": git.version_str, "oracle": "merge-tree --write-tree",
-            "duration_ms": 0, "error": None, "semantic": None,
-            "cached": {"self": False, "peer": False},
-            "finding_id": None, "arbiter": None,
-            # unaffected by suppression when there is no finding to suppress
-            "surfaced": True, "surface_rate": rate, "surface_salt": salt,
-        }
-        tmp_dirs = []
-        try:
-            if my_err:
-                raise RuntimeError("self snapshot failed: %s" % my_err)
-            if not os.path.isdir(p["worktree"]):
-                raise RuntimeError("peer worktree missing: %s" % p["worktree"])
-            if cd:
-                ptree, pcommit, peer_cached = snapshot_peer_cached(git, p["worktree"], cd, phead)
-            else:
-                ptree, pcommit = snapshot(git, p["worktree"])
-                peer_cached = False
-            rec["peer"]["tree"] = ptree
-            rec["cached"]["peer"] = peer_cached
-            verdict, paths, merged_tree = oracle_tree(git, top, my_commit, pcommit)
-            rec["verdict"] = verdict
-            rec["conflict_paths"] = paths
-            if verdict == "clean":
-                # nothing to verify on a textual conflict: it will not merge as-is
-                t1 = time.time()
-                self_dir = tempfile.mkdtemp(prefix="moire-verify-self-")
-                peer_dir = tempfile.mkdtemp(prefix="moire-verify-peer-")
-                merged_dir = tempfile.mkdtemp(prefix="moire-verify-merged-")
-                tmp_dirs = [self_dir, peer_dir, merged_dir]
-                materialize_tree(git, top, my_tree, self_dir)
-                materialize_tree(git, top, ptree, peer_dir)
-                materialize_tree(git, top, merged_tree, merged_dir)
-                self_broken = run_checker(checker, self_dir, timeout)
-                peer_broken = run_checker(checker, peer_dir, timeout)
-                merged_broken = run_checker(checker, merged_dir, timeout)
-                new_breakage = merged_broken - self_broken - peer_broken
-                rec["semantic"] = {
-                    "checker": checker,
-                    "merged_tree": merged_tree,
-                    "new_breakage": sorted([list(x) for x in new_breakage],
-                                           key=lambda x: [str(e) for e in x]),
-                    "self_broken": len(self_broken),
-                    "peer_broken": len(peer_broken),
-                    "merged_broken": len(merged_broken),
-                    "duration_ms": int((time.time() - t1) * 1000),
-                }
-            fid = compute_finding_id(top, p["worktree"], _finding_paths(rec))
-            rec["finding_id"] = fid
-            if fid:
-                rec["surfaced"] = is_surfaced(fid, rate, salt)
-                rec["arbiter"] = compute_arbiter(git, top, self_info, peer_info,
-                                                 my_tree, my_commit, ptree, pcommit)
-        except Exception as ex:
-            rec["verdict"] = "error"      # covers a checker timeout too - never breakage
-            rec["semantic"] = None
-            rec["error"] = str(ex)
-        finally:
-            for d in tmp_dirs:
+    # Self's materialised tree and checker result are identical for every peer:
+    # materialise and check lazily on FIRST need, memoise for the rest of the
+    # call, and clean the directory up once after the loop (checker cost goes
+    # 3N -> 2N+1). Lazy so nothing is materialised at all when every peer
+    # errors out before its semantic pass. Memoised only on success: a failed
+    # self check is retried per peer, exactly like the old per-peer behaviour.
+    self_state = {"dir": None, "broken": None, "linked": []}
+
+    def _self_checked():
+        if self_state["broken"] is None:
+            d = tempfile.mkdtemp(prefix="moire-verify-self-")
+            try:
+                materialize_tree(git, top, my_tree, d)
+                self_linked = link_directories(d, top, links)
+                broken = run_checker(checker, d, timeout)
+            except BaseException:     # KeyboardInterrupt too: self_state["dir"] is
+                                      # still None here, so the outer finally would
+                                      # never see this directory - clean it now.
                 shutil.rmtree(d, ignore_errors=True)
-        rec["duration_ms"] = int((time.time() - t0) * 1000)
-        records.append(rec)
+                raise
+            self_state["dir"] = d
+            self_state["broken"] = broken
+            self_state["linked"] = self_linked
+        return self_state["broken"]
+
+    try:
+        for p in peers:
+            t0 = time.time()
+            phead = p.get("head")
+            if phead is None and os.path.isdir(p["worktree"]):
+                phead = git.out(["rev-parse", "HEAD"], cwd=p["worktree"])
+            self_info = {"worktree": top, "branch": me.get("branch"), "head": me.get("head")}
+            peer_info = {"worktree": p["worktree"], "branch": p.get("branch"), "head": phead}
+            rec = {
+                "v": 1, "check_id": check_id, "ts": ts, "repo_common_dir": cd,
+                "self": {"worktree": top, "branch": me.get("branch"),
+                         "head": me.get("head"), "tree": my_tree, "agent_id": agent_id},
+                "peer": {"worktree": p["worktree"], "branch": p.get("branch"),
+                         "head": phead, "tree": None,
+                         "agent_id": read_agent_marker(cd, p["worktree"]) if cd else None},
+                "verdict": "error", "conflict_paths": [],
+                "git_version": git.version_str, "oracle": "merge-tree --write-tree",
+                "duration_ms": 0, "error": None, "semantic": None,
+                "cached": {"self": False, "peer": False},
+                "finding_id": None, "arbiter": None,
+                # unaffected by suppression when there is no finding to suppress
+                "surfaced": True, "surface_rate": rate, "surface_salt": salt,
+            }
+            tmp_dirs = []
+            try:
+                if my_err:
+                    raise RuntimeError("self snapshot failed: %s" % my_err)
+                if not os.path.isdir(p["worktree"]):
+                    raise RuntimeError("peer worktree missing: %s" % p["worktree"])
+                if cd:
+                    ptree, pcommit, peer_cached = snapshot_peer_cached(git, p["worktree"], cd, phead)
+                else:
+                    ptree, pcommit = snapshot(git, p["worktree"])
+                    peer_cached = False
+                rec["peer"]["tree"] = ptree
+                rec["cached"]["peer"] = peer_cached
+                verdict, paths, merged_tree = oracle_tree(git, top, my_commit, pcommit)
+                rec["verdict"] = verdict
+                rec["conflict_paths"] = paths
+                if verdict == "clean" or (verdict == "conflict" and checker == "builtin-ast"):
+                    # Under a textual conflict, merge-tree still writes a merged
+                    # tree - conflicting paths carry baked-in conflict markers. Only
+                    # builtin-ast is safe on such a tree: a marker-laden .py is
+                    # unparsable, so the checker withholds judgement for it and its
+                    # importers (zero false positives by construction). An external
+                    # checker would emit a syntax-error cascade whose diagnostics
+                    # land in importers - paths NOT in conflict_paths - so for an
+                    # external checker the semantic pass stays skipped (None).
+                    # Self is materialised and checked ONCE per verify (memoised):
+                    # the first peer to need it pays the full cost, recorded as
+                    # self_duration_ms; peers reusing the memo record 0. duration_ms
+                    # below is therefore MARGINAL per peer and comparable across
+                    # peers - it never absorbs the shared self pass.
+                    paid_self = self_state["broken"] is None
+                    t_self = time.time()
+                    self_broken = _self_checked()
+                    self_ms = int((time.time() - t_self) * 1000) if paid_self else 0
+                    t1 = time.time()
+                    peer_dir = tempfile.mkdtemp(prefix="moire-verify-peer-")
+                    merged_dir = tempfile.mkdtemp(prefix="moire-verify-merged-")
+                    tmp_dirs = [peer_dir, merged_dir]
+                    materialize_tree(git, top, ptree, peer_dir)
+                    materialize_tree(git, top, merged_tree, merged_dir)
+                    # sources per tree: self <- self's worktree, peer <- the
+                    # peer's worktree, merged <- self's worktree (a deliberate
+                    # approximation - see link_directories).
+                    peer_linked = link_directories(peer_dir, p["worktree"], links)
+                    merged_linked = link_directories(merged_dir, top, links)
+                    peer_broken = run_checker(checker, peer_dir, timeout)
+                    merged_broken = run_checker(checker, merged_dir, timeout)
+                    new_breakage = merged_broken - self_broken - peer_broken
+                    excluded = 0
+                    if verdict == "conflict":
+                        # Breakage ON a conflicting path is the textual conflict
+                        # restated, not an extra semantic finding - drop it. What
+                        # survives is breakage on files entirely disjoint from the
+                        # conflict, which the old all-or-nothing gate never saw.
+                        cp = set(paths)
+                        kept = set()
+                        for x in new_breakage:
+                            first = x[0] if isinstance(x, (tuple, list)) and x else x
+                            if str(first) in cp:
+                                excluded += 1
+                            else:
+                                kept.add(x)
+                        new_breakage = kept
+                    # builtin-ast findings are (path, module, name) tuples -> lists;
+                    # an external checker's are whole stdout lines (strings), which
+                    # list() would explode into characters. Types are homogeneous
+                    # within one record (one checker per run), so the type-aware
+                    # sort key is safe.
+                    nb = [list(x) if isinstance(x, tuple) else x for x in new_breakage]
+                    nb.sort(key=lambda x: [str(e) for e in x] if isinstance(x, list) else [x])
+                    rec["semantic"] = {
+                        "checker": checker,
+                        "merged_tree": merged_tree,
+                        "new_breakage": nb,
+                        "self_broken": len(self_broken),
+                        "peer_broken": len(peer_broken),
+                        "merged_broken": len(merged_broken),
+                        "duration_ms": int((time.time() - t1) * 1000),
+                        "self_duration_ms": self_ms,
+                        # Per tree, not a union: an asymmetry (e.g. peer tree got
+                        # no link because the peer worktree lacks the directory,
+                        # while merged borrowed self's) is exactly what explains
+                        # a checker's output failing to cancel - a union hides it.
+                        "linked": {"self": sorted(self_state["linked"]),
+                                   "peer": sorted(peer_linked),
+                                   "merged": sorted(merged_linked)},
+                    }
+                    if verdict == "conflict":
+                        # Omitted entirely on the clean path so existing records
+                        # stay comparable.
+                        rec["semantic"]["under_conflict"] = True
+                        rec["semantic"]["excluded_conflict_paths"] = excluded
+                fid = compute_finding_id(top, p["worktree"], _finding_paths(rec))
+                rec["finding_id"] = fid
+                if fid:
+                    rec["surfaced"] = is_surfaced(fid, rate, salt)
+                    rec["arbiter"] = compute_arbiter(git, top, self_info, peer_info,
+                                                     my_tree, my_commit, ptree, pcommit)
+            except Exception as ex:
+                rec["verdict"] = "error"      # covers a checker timeout too - never breakage
+                rec["semantic"] = None
+                rec["error"] = str(ex)
+            finally:
+                for d in tmp_dirs:
+                    shutil.rmtree(d, ignore_errors=True)
+            rec["duration_ms"] = int((time.time() - t0) * 1000)
+            records.append(rec)
+    finally:
+        if self_state["dir"]:
+            shutil.rmtree(self_state["dir"], ignore_errors=True)
 
     # Notes are read ONLY here, strictly after every verdict above is final -
     # same non-negotiable as cmd_check.
@@ -1292,7 +1421,7 @@ def cmd_verify(git, argv):
             os.makedirs(ld)
         except OSError:
             pass
-        name = "%s-%d-%s.json" % (datetime.utcnow().strftime("%Y%m%dT%H%M%S%f"),
+        name = "%s-%d-%s.json" % (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f"),
                                   os.getpid(), uuid.uuid4().hex[:6])
         tmp = os.path.join(ld, "." + name + ".tmp")
         with open(tmp, "w") as f:
@@ -1310,8 +1439,13 @@ def cmd_verify(git, argv):
             if r["verdict"] == "conflict":
                 if not r.get("surfaced", True):
                     continue           # suppressed: logged above in full, but the agent sees nothing
-                sys.stdout.write("CONFLICT with %s (%s) - textual; semantic check skipped [finding %s]\n" %
+                sem = r.get("semantic")
+                sys.stdout.write("CONFLICT with %s (%s) [finding %s]\n" %
                                  (peer, r["peer"]["branch"] or "detached", r.get("finding_id")))
+                if sem is None:
+                    sys.stdout.write("  semantic check not attempted: external checker cannot be "
+                                     "trusted on a tree containing conflict markers "
+                                     "(%d conflicting paths)\n" % len(r["conflict_paths"]))
                 for pth in r["conflict_paths"]:
                     sys.stdout.write("    %s\n" % pth)
                 for note in r.get("peer_notes") or []:
@@ -1319,6 +1453,16 @@ def cmd_verify(git, argv):
                 arb = r.get("arbiter")
                 if arb:
                     sys.stdout.write("  arbiter: %s yields (%s)\n" % (arb["yield"], arb["reason"]))
+                new = (sem or {}).get("new_breakage") or []
+                if new:
+                    # The builtin ran under the conflict and found breakage on
+                    # files disjoint from it - two dimensions of one finding,
+                    # so both blocks print for this peer.
+                    sys.stdout.write("BROKEN  with %s (%d new breakage(s), merged tree %s) [finding %s]\n" %
+                                     (peer, len(new), sem.get("merged_tree"), r.get("finding_id")))
+                    for item in new:
+                        sys.stdout.write("    %s\n" %
+                                         (tuple(item) if isinstance(item, list) else item,))
             elif r["verdict"] == "error":
                 sys.stdout.write("error   with %s: %s\n" % (peer, r["error"]))
             else:
@@ -1330,7 +1474,10 @@ def cmd_verify(git, argv):
                     sys.stdout.write("BROKEN  with %s (%d new breakage(s), merged tree %s) [finding %s]\n" %
                                      (peer, len(new), sem.get("merged_tree"), r.get("finding_id")))
                     for item in new:
-                        sys.stdout.write("    %s\n" % (tuple(item),))
+                        # builtin findings are lists (JSON round-trip of tuples);
+                        # an external checker's finding is one raw string line.
+                        sys.stdout.write("    %s\n" %
+                                         (tuple(item) if isinstance(item, list) else item,))
                     for note in r.get("peer_notes") or []:
                         sys.stdout.write("    peer (%s): %s\n" % (note.get("source","agent"), note["text"]))
                     arb = r.get("arbiter")
@@ -1408,12 +1555,12 @@ def cmd_explain(git, argv):
         pass
     note = {
         "v": 1, "finding_id": finding_id,
-        "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "worktree": top, "branch": branch,
         "source": source,
         "text": _sanitize_note_text(text),
     }
-    name = "%s-%s-%d.json" % (finding_id, datetime.utcnow().strftime("%Y%m%dT%H%M%S%f"), os.getpid())
+    name = "%s-%s-%d.json" % (finding_id, datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f"), os.getpid())
     path = os.path.join(nd, name)
     tmp = os.path.join(nd, "." + name + ".tmp")
     with open(tmp, "w") as f:
@@ -1428,8 +1575,14 @@ def cmd_doctor(git, argv):
     healthy = [True]
 
     def say(good, label, detail=""):
-        healthy[0] = healthy[0] and good
-        sys.stdout.write("[%s] %s%s\n" % ("ok" if good else "FAIL", label,
+        # Three states: True -> [ok], False -> [FAIL] (clears healthy, nonzero
+        # exit), "warn" -> [warn] (observational; never touches the exit code).
+        if good == "warn":
+            tag = "warn"
+        else:
+            healthy[0] = healthy[0] and good
+            tag = "ok" if good else "FAIL"
+        sys.stdout.write("[%s] %s%s\n" % (tag, label,
                                           (" - " + detail) if detail else ""))
 
     good = git.path is not None and git.version >= MIN_GIT
@@ -1476,6 +1629,44 @@ def cmd_doctor(git, argv):
 
     wts = list_worktrees(git, cwd)
     say(True, "worktrees discoverable", "%d found" % len(wts))
+
+    # Observational, never a FAIL: a top-level directory that exists in the
+    # MAIN worktree and is git-ignored there (node_modules, .venv, vendor,
+    # target, ...) but is absent from a linked worktree usually means
+    # dependencies were never installed in that worktree - a checker run
+    # there will drown in unresolved imports. Zero package-manager semantics:
+    # only "exists + ignored in main, missing in linked" is observed.
+    if len(wts) > 1:
+        main_wt = wts[0]["worktree"]  # `git worktree list` puts the main worktree first
+        try:
+            entries = sorted(os.listdir(main_wt))
+        except OSError:
+            entries = []
+        candidates = [nm for nm in entries
+                      if nm != ".git" and os.path.isdir(os.path.join(main_wt, nm))]
+        ignored_dirs = []
+        if candidates:
+            # One `check-ignore --stdin` for all candidates, not one subprocess
+            # per directory. -z on both sides sidesteps core.quotePath mangling.
+            p = subprocess.Popen([git.path, "-C", main_wt, "check-ignore", "--stdin", "-z"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL)
+            out_ig, _ = p.communicate(
+                b"\0".join(nm.encode("utf-8") for nm in candidates) + b"\0")
+            ignored_dirs = [x.decode("utf-8", "replace")
+                            for x in out_ig.split(b"\0") if x]
+        # One warn per linked worktree, however many directories are missing -
+        # a typical ignore file (dist, build, coverage, ...) would otherwise
+        # bury the node_modules line that actually matters.
+        for w in wts[1:]:
+            missing = [nm for nm in ignored_dirs
+                       if not os.path.isdir(os.path.join(w["worktree"], nm))]
+            if missing:
+                shown = ", ".join(missing[:5])
+                if len(missing) > 5:
+                    shown += " +%d more" % (len(missing) - 5)
+                say("warn", "dependency dirs missing in %s" % w["worktree"],
+                    "%s (present and git-ignored in %s)" % (shown, main_wt))
 
     return 0 if healthy[0] else 1
 
@@ -1897,6 +2088,7 @@ def cmd_init_swarm(git, argv):
     step("== worktrees ==")
     parent = os.path.dirname(top)
     repo_name = os.path.basename(top)
+    created_any = False
     for i in range(1, n + 1):
         branch = "%s-%d" % (prefix, i)
         path = os.path.join(parent, "%s-%s-%d" % (repo_name, prefix, i))
@@ -1905,6 +2097,7 @@ def cmd_init_swarm(git, argv):
             continue
         if dry_run:
             step("  [dry-run] would create worktree %s (branch %s)" % (path, branch))
+            created_any = True        # the note below applies to what WOULD exist
             continue
         branch_exists = git.out(["rev-parse", "--verify", "--quiet",
                                  "refs/heads/%s" % branch], cwd=top) is not None
@@ -1916,6 +2109,18 @@ def cmd_init_swarm(git, argv):
             ok = False
             continue
         step("  created: %s (branch %s)" % (path, branch))
+        created_any = True
+    # Static and language-agnostic on purpose: no detection, no package-manager
+    # knowledge. Auto-symlinking one shared dependency directory across N
+    # worktrees would manufacture exactly the cross-worktree interference moire
+    # exists to detect. Printed only when a worktree was actually created:
+    # advice about fresh worktrees is noise when none exist.
+    if created_any:
+        step("  note: fresh worktrees contain only tracked files. Project-local dependency")
+        step("        directories (node_modules, .venv, vendor, target) are not created.")
+        step("        Install dependencies in each worktree separately - do not share one")
+        step("        dependency directory across worktrees via symlink: concurrent agents")
+        step("        would then be mutating each other's dependencies.")
 
     # 3. Install -- reuses cmd_install() verbatim, never duplicated --------
     step("== install ==")
@@ -2046,10 +2251,33 @@ def _pair_key(rec):
 def _finding_kind(rec):
     """-> 'textual' | 'semantic' for a record that carries a finding_id.
     Textual: verdict == 'conflict' (check or verify, `conflict_paths` is
-    what named the finding). Semantic: the only other way a finding_id gets
-    set is verify's clean-but-broken-merge case (`semantic.new_breakage`).
+    what named the finding). Semantic: verify's clean-but-broken-merge case
+    (`semantic.new_breakage` under a clean verdict). A conflict record may
+    now ALSO carry `semantic.new_breakage` - the builtin checker runs under
+    a textual conflict for breakage on files disjoint from it - and is still
+    classified 'textual', because `_finding_paths` keys the finding on
+    `conflict_paths`; that extra dimension is surfaced separately as
+    `semantic_findings_under_conflict` in `report`.
     """
     return "textual" if rec.get("verdict") == "conflict" else "semantic"
+
+
+def _semantic_skipped(rec):
+    """-> True when a verify record's semantic pass was skipped because the
+    merge conflicted textually. Derived, not stored: check records carry no
+    "semantic" key at all, verify records always do (None until computed), so
+    the three-way test is exact on logs already collected."""
+    return "semantic" in rec and rec["semantic"] is None and rec.get("verdict") == "conflict"
+
+
+def _semantic_under_conflict_finding(rec):
+    """-> True for a verify record whose builtin checker ran UNDER a textual
+    conflict and found breakage on files disjoint from it. One shared
+    predicate so `report` and `report --study` can never disagree on which
+    records this counts."""
+    sem = rec.get("semantic")
+    return (isinstance(sem, dict) and bool(sem.get("under_conflict"))
+            and bool(sem.get("new_breakage")))
 
 
 def _study_metrics(records):
@@ -2174,6 +2402,15 @@ def _report_study(records, as_json):
             "textual": _arm_summary(textual_fids, meta),
             "semantic": _arm_summary(semantic_fids, meta),
         },
+        # Records whose semantic pass never ran because the merge conflicted
+        # textually - without this, kind_split silently under-reports the
+        # semantic dimension (a skipped check is not a clean one).
+        "skipped_semantic_checks": sum(1 for r in records if _semantic_skipped(r)),
+        # Builtin-checker breakage found UNDER a textual conflict, on files
+        # disjoint from it. Same predicate as `report`, so the two commands
+        # count the same records; excluded from any rate (not clean merges).
+        "semantic_findings_under_conflict": sum(
+            1 for r in records if _semantic_under_conflict_finding(r)),
     }
 
     if as_json:
@@ -2209,6 +2446,10 @@ def _report_study(records, as_json):
     sys.stdout.write("\ntextual vs semantic:\n")
     _print_arm("textual", study["kind_split"]["textual"])
     _print_arm("semantic", study["kind_split"]["semantic"])
+    sys.stdout.write("  skipped semantic checks (textual conflict pre-empted the pass): %d\n" %
+                     study["skipped_semantic_checks"])
+    sys.stdout.write("  semantic findings under conflict (disjoint breakage; not in any rate): %d\n" %
+                     study["semantic_findings_under_conflict"])
 
     return 0
 
@@ -2239,12 +2480,32 @@ def cmd_report(git, argv):
     top_paths = sorted(paths.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
     base_rate = (float(len(conflicts)) / len(pairs)) if pairs else None
 
+    # The semantic dimension, measured separately from the textual base_rate
+    # above (whose meaning is unchanged: textual conflicts / textual pairs).
+    # A verify record whose semantic pass actually ran carries a dict; one
+    # pre-empted by a textual conflict is counted as skipped, not clean.
+    # under_conflict records are excluded from the rate: they are not clean
+    # merges, and the published kill criterion is about clean merges. Their
+    # findings are surfaced separately below so nothing is discarded.
+    semantic_pairs = [r for r in records
+                      if isinstance(r.get("semantic"), dict)
+                      and not r["semantic"].get("under_conflict")]
+    semantic_breakages = [r for r in semantic_pairs if r["semantic"].get("new_breakage")]
+    semantic_rate = (float(len(semantic_breakages)) / len(semantic_pairs)) if semantic_pairs else None
+    under_conflict_findings = [r for r in records if _semantic_under_conflict_finding(r)]
+    skipped_semantic = sum(1 for r in records if _semantic_skipped(r))
+
     if as_json:
         sys.stdout.write(json.dumps({
             "checks": checks, "checks_with_peers": len(with_peer),
             "peer_pairs_evaluated": len(pairs), "conflicts": len(conflicts),
             "errors": len(errors), "distinct_peers": len(peers),
             "base_rate": base_rate, "top_paths": top_paths,
+            "semantic_pairs": len(semantic_pairs),
+            "semantic_breakages": len(semantic_breakages),
+            "semantic_rate": semantic_rate,
+            "semantic_findings_under_conflict": len(under_conflict_findings),
+            "skipped_semantic_checks": skipped_semantic,
         }, indent=2) + "\n")
         return 0
 
@@ -2255,9 +2516,17 @@ def cmd_report(git, argv):
     sys.stdout.write("conflicting pairs          : %d\n" % len(conflicts))
     sys.stdout.write("errors                     : %d\n" % len(errors))
     if base_rate is None:
-        sys.stdout.write("base rate                  : n/a (no pairs evaluated)\n")
+        sys.stdout.write("base rate (textual)        : n/a (no pairs evaluated)\n")
     else:
-        sys.stdout.write("base rate                  : %.1f%%\n" % (100.0 * base_rate))
+        sys.stdout.write("base rate (textual)        : %.1f%%\n" % (100.0 * base_rate))
+    sys.stdout.write("semantic pairs evaluated   : %d\n" % len(semantic_pairs))
+    sys.stdout.write("semantic breakages         : %d\n" % len(semantic_breakages))
+    if semantic_rate is None:
+        sys.stdout.write("semantic rate (clean merges that break) : n/a (no clean-merge semantic pairs)\n")
+    else:
+        sys.stdout.write("semantic rate (clean merges that break) : %.1f%%\n" % (100.0 * semantic_rate))
+    sys.stdout.write("semantic findings under conflict        : %d\n" % len(under_conflict_findings))
+    sys.stdout.write("skipped semantic checks    : %d\n" % skipped_semantic)
     if top_paths:
         sys.stdout.write("\ntop contested paths:\n")
         for p, n in top_paths:
@@ -2269,9 +2538,12 @@ USAGE = """\
 moire - observed-diff conflict detection between concurrent git worktrees
 
   moire check [--json] [--peers a,b]   would my worktree conflict with each peer, right now?
-  moire verify [--json] [--peers a,b] [--checker <cmd>]
+  moire verify [--json] [--peers a,b] [--checker <cmd>] [--link <name>]...
                                     exact semantic check on the merge-tree already produced:
                                     would landing together break something, even textually clean?
+                                    --link symlinks a named untracked directory (e.g.
+                                    node_modules) from each worktree into its materialised
+                                    tree so external checkers can resolve dependencies
   moire explain <finding_id> <text...> file a display-only note against a finding id (never gates a verdict)
   moire doctor                         verify git version, hooks, install, state dir
   moire install [--print-client-hooks] install git hooks into $GIT_COMMON_DIR/hooks/
@@ -2296,7 +2568,9 @@ Env vars:
   MOIRE_AGENT_ID       string, default unset - a label recorded alongside each check/verify
                     record for cross-agent vs same-agent analysis; never affects a verdict
 
-Warn-only by design: `check` and `verify` always exit 0. Requires git >= 2.38.
+Warn-only by design: `check` and `verify` never exit nonzero because of a
+finding; they refuse with 2 on an unusable environment or a bad argument,
+before writing any log. Requires git >= 2.38.
 """
 
 
