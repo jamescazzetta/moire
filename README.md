@@ -110,6 +110,12 @@ It sets up worktrees and wires the tool — it does **not** decide what each age
 works on. Partitioning work across agents is a different and much harder problem,
 and deliberately out of scope.
 
+A fresh worktree has tracked files only — no `node_modules`, `.venv`, `vendor`, or
+other install output. Install dependencies in each worktree separately; do not
+symlink one dependency directory across worktrees to skip the step. Concurrent
+agents would then be mutating each other's dependencies, which is exactly the
+class of interference moire exists to detect.
+
 `wire-client` prints a unified diff and writes nothing until you pass `--apply`.
 It preserves hooks you already have, keeps a `.moire-backup`, refuses to touch a
 file it cannot parse, and reports "already wired" on a second run. That config
@@ -180,7 +186,7 @@ Neither skill decides how to split the work. That judgement stays with you.
 | `moire init-swarm` | Create N worktrees, install, place the skill, verify |
 | `moire wire-client` | Merge the hook into a client's settings (diff, then `--apply`) |
 
-Both `check` and `verify` **always exit 0**. They warn; they never fail your build.
+`check` and `verify` **never exit nonzero because of a finding** — they warn; they never fail your build. The one exception is a refusal: they exit 2 on an unusable environment or a bad argument (no usable git, an invalid `--link` name), before writing any log.
 
 ## How it works
 
@@ -196,9 +202,31 @@ For each peer worktree:
 
    Breakage already present in someone's branch is their own problem, not a collision.
 
-The default checker is a small Python import resolver with no dependencies. `--checker 'mypy .'` or `--checker 'pytest -x'` swaps in whatever your repo already runs — so the check gets stronger for free as your own test suite does.
+The default checker is a small Python import resolver with no dependencies: it proves an imported name still resolves, not that its contract held — a function whose exported name is unchanged while its return type widens from `string` to `string | null` is invisible to it. For a statically-typed language, point `--checker` at a real type checker.
 
-**Cost:** ~187 ms per write with 3 peers (warm), ~335 ms cold. Peer snapshots are cached; your own is always recomputed, because a stale self-snapshot is the one error that would silently produce a wrong answer.
+Because that set difference is computed over the checker's output *lines*, a checker has to be deterministic and emit one finding per line with repo-relative paths. Break those rules and you get false breakage rather than silence, so read the contract before pointing `--checker` at something.
+
+<details>
+<summary><strong>The <code>--checker</code> contract</strong> — read this before writing or choosing one</summary>
+
+- **One finding per line, deterministic.** Identical input must give identical output. No timestamps, durations, run counts or summary lines: anything that varies between runs never cancels in the set difference and surfaces as false breakage. This is why a bare `pytest -x` or `mypy .` is unsound — both print a summary line that differs run to run.
+- **Repo-relative paths.** The three trees are materialised into three different temporary directories, so an absolute path never cancels and always reports false breakage.
+- **Strip line and column numbers.** A finding string embedding a position changes whenever an unrelated edit shifts lines — it fails to cancel, and it churns the `finding_id` that recurrence tracking and `moire explain` key on. `tsc` emits `src/x.ts(4,1): error TS2551: …`, so it needs `| sed -E "s/\([0-9]+,[0-9]+\)//"`.
+- **It runs on tracked files only.** The materialised tree is `git archive` output — no gitignored `node_modules`, `.venv` or `vendor`. `--link <name>` symlinks a named directory from the worktree into each tree instead; `<name>` must be a single path component. The link is live, not read-only, so only link a directory you're content to have your checker write into — `tsc --incremental`, `eslint --cache` and anything using `node_modules/.cache` write through it into the real worktree.
+- **Invoke tool binaries directly**, never through `npm run` / `pnpm exec` / `yarn run`. The materialised tree is not a project directory, and package-manager wrappers do their own project discovery and dependency repair as a side effect of running your command — under a hook there's no TTY for that to fail safely against.
+- **Non-source import targets are unresolved, not broken.** If you're writing a checker: a relative import resolving to a `.json`, `.css` or `.svg` has no export syntax to find. Treat it like an unresolvable path — an alias, a bundler-only import — not a missing export. This was the most common false positive when a reference TS/JS resolver was written against moire.
+
+A worked example, satisfying all six:
+
+```bash
+moire verify --checker './node_modules/.bin/tsc --noEmit | sed -E "s/\([0-9]+,[0-9]+\)//"' --link node_modules
+```
+
+</details>
+
+**Cost:** ~187 ms warm, ~335 ms cold, for `check` plus a **builtin**-checker `verify` against 3 peers, measured on this repo. Peer snapshots are cached; your own is always recomputed, because a stale self-snapshot is the one error that would silently produce a wrong answer.
+
+Point `--checker` at anything real and that figure stops applying: cost becomes `snapshot overhead + K × checker runtime`, where `K = 2 × peers + 1` — self is checked once per run, peer and merged once per peer. With a checker in the seconds range, that puts `verify` past what belongs on a per-write hook: run `check` on every write, and `verify` before declaring a task done, which is what `skills/moire-parallel/SKILL.md` already instructs. `verify --json` reports its own elapsed time, so you measure your own cost instead of trusting this one.
 
 ## Why not do it another way?
 
@@ -263,12 +291,13 @@ The tool is what survived that.
 
 ## Status — read this before adopting
 
-**The mechanism works and is tested.** 54 tests across four suites, all passing, including a negative-control run proving the suite can actually fail.
+**The mechanism works and is tested.** 72 tests across five suites, all passing (one skips below Python 3.12), including a negative-control run proving the suite can actually fail.
 
 **What is unknown is the frequency, not the existence.** The failure is real and easy to
-reproduce — `tests/` contains a fixture for it. What nobody has published, as far as I
+reproduce — case 2 of `tests/test_verify.sh` is exactly it: one agent renames a function,
+another adds a file calling the old name, git merges clean, `verify` catches it. What nobody has published, as far as I
 can find, is how *often* two concurrent agents produce a clean merge that doesn't work.
-That number is what decides whether this is worth ~187 ms on every write.
+That number is what decides whether `verify` is worth its cost. It runs before declaring a task done, not on every write — only `check` sits on that hook.
 
 A search of human open-source history turned up little, but that says less than it
 sounds like: it covered one failure mode (cross-module references, not changed
@@ -291,6 +320,7 @@ bash tests/test_oracle.sh    # 12 cases: conflict detection vs real `git merge`
 bash tests/test_install.sh   # 16 cases: install, hooks, path resolution, concurrency
 bash tests/test_study.sh     # 12 cases: finding IDs, randomised suppression, agent identity
 bash tests/test_setup.sh     # 14 cases: init-swarm, wire-client, HOME containment
+bash tests/test_verify.sh    # 18 cases: the semantic path — new_breakage, --link, report fields
 ```
 
 Every suite verifies against independent ground truth and has been shown to fail when the implementation is stubbed out. A test suite that cannot fail is worse than none.
@@ -302,7 +332,7 @@ bin/moire        the tool — a single file, Python 3.8, standard library only
 bin/moire.js     Node launcher, used only by the npm distribution
 skills/          two Agent Skills: one for acting on a finding, one for
                  setting up parallel work
-tests/           54 tests across four suites
+tests/           72 tests across five suites
 package.json     npm packaging
 README.md        this file
 LICENSE          MIT

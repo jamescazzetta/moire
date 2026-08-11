@@ -32,6 +32,11 @@ This creates `../<repo>-agent-1`, `-2`, `-3`, installs the binary and git hooks 
 `.git/` (shared by every worktree), places the skills, and runs `doctor`. It is
 idempotent and `--dry-run` shows the plan without touching anything.
 
+Each worktree is tracked files only. Install dependencies in each one separately —
+do not symlink a shared `node_modules`, `.venv`, or `vendor` across worktrees to
+skip the step. Concurrent agents would then be mutating each other's dependencies,
+which is exactly the class of interference moire exists to detect.
+
 If `moire doctor` reports the client hook is not wired, run this once — it prints a
 diff first and writes nothing until `--apply`:
 
