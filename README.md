@@ -62,9 +62,9 @@ moire init-swarm --agents 3                     # worktrees, hooks, skills, veri
 moire wire-client claude --scope user --apply   # shows a diff first
 ```
 
-Needs **git ≥ 2.38** and **Python 3.8+**. No daemon, no server, no config file, no
-account, and nothing written into your working tree. Uninstalling is deleting a
-directory.
+Needs **git ≥ 2.38** and **Python 3.8+**. No daemon, no server, no config file — per-repo
+settings live in `git config`, which never travels with a clone — no account, and nothing
+written into your working tree. Uninstalling is deleting a directory.
 
 ## Where it fits
 
@@ -177,7 +177,7 @@ Neither skill decides how to split the work. That judgement stays with you.
 | | |
 |---|---|
 | `moire check` | Would my worktree conflict **textually** with each peer, right now? |
-| `moire verify` | Would the merged result be **semantically broken**, right now? |
+| `moire verify` | Would the merged result be **semantically broken**, right now? Reads `moire.checker` / `moire.link` from `git config` when `--checker` / `--link` are absent. |
 | `moire explain <id> <text>` | Attach a one-sentence *why* to a specific finding. Advisory only — it can never change a verdict. |
 | `moire install` | Install git hooks and the binary into `.git/` |
 | `moire doctor` | Check git version, hook wiring, install state |
@@ -204,7 +204,33 @@ For each peer worktree:
 
 The default checker is a small Python import resolver with no dependencies: it proves an imported name still resolves, not that its contract held — a function whose exported name is unchanged while its return type widens from `string` to `string | null` is invisible to it. For a statically-typed language, point `--checker` at a real type checker.
 
-Because that set difference is computed over the checker's output *lines*, a checker has to be deterministic and emit one finding per line with repo-relative paths. Break those rules and you get false breakage rather than silence, so read the contract before pointing `--checker` at something.
+It **reads Python only**, and it says so rather than implying otherwise. When the merged tree contains no `.py` files there is nothing it can examine, so `verify` reports that instead of claiming the merge is fine:
+
+```
+$ moire verify
+clean   with /repo-agent-b (textual only - no semantic check was performed)
+  builtin-ast examined 0 of 847 files: it reads only Python and this tree has no .py files.
+  The merged result was NOT semantically verified - "clean" above means only that git found no textual conflict.
+  To enable semantic verification for this repo: git config moire.checker '<command>'   (README: the --checker contract)
+```
+
+Such a record is excluded from `moire report`'s semantic rate and counted under `unperformed_semantic_checks` instead — a check that measured nothing must not be averaged in as a clean one. On the happy path the same honesty appears as scope: `(semantic ok: self=0 peer=0 merged=0 broken; builtin-ast examined 12 of 40 files - python only)`.
+
+### Pointing `verify` at your language, per repo
+
+Set the checker once per clone and every agent only ever types `moire verify`:
+
+```bash
+git config moire.checker './node_modules/.bin/tsc --noEmit | sed -E "s/\([0-9]+,[0-9]+\)//"'
+git config --add moire.link node_modules
+moire doctor      # warns when `verify` would have nothing to read
+```
+
+This is `git config`, not a file committed to the repository, and the difference is the point: `.git/config` is never cloned, so a checkout cannot carry a command that runs on someone else's machine. Setting it requires local write access to the clone — the same trust level as installing moire's hooks, and the same stance as the `core.hooksPath` warning in `moire doctor`.
+
+It lives in `$GIT_COMMON_DIR`, so one setting covers every worktree of the swarm. `--checker` and `--link` still work and take precedence: `--checker` flag > `moire.checker` > `builtin-ast`, and links are the union of both sources. An invalid `moire.link` name is refused with exit 2 before any log is written, exactly like an invalid `--link`.
+
+Because that set difference is computed over the checker's output *lines*, a checker has to be deterministic and emit one finding per line with repo-relative paths. Break those rules and you get false breakage rather than silence, so read the contract before pointing `--checker` or `moire.checker` at something.
 
 <details>
 <summary><strong>The <code>--checker</code> contract</strong> — read this before writing or choosing one</summary>
@@ -216,7 +242,7 @@ Because that set difference is computed over the checker's output *lines*, a che
 - **Invoke tool binaries directly**, never through `npm run` / `pnpm exec` / `yarn run`. The materialised tree is not a project directory, and package-manager wrappers do their own project discovery and dependency repair as a side effect of running your command — under a hook there's no TTY for that to fail safely against.
 - **Non-source import targets are unresolved, not broken.** If you're writing a checker: a relative import resolving to a `.json`, `.css` or `.svg` has no export syntax to find. Treat it like an unresolvable path — an alias, a bundler-only import — not a missing export. This was the most common false positive when a reference TS/JS resolver was written against moire.
 
-A worked example, satisfying all six:
+The worked example above — `tsc --noEmit` piped through `sed` to strip positions, with `node_modules` linked — satisfies all six. The same thing as a one-off flag, without configuring the repo:
 
 ```bash
 moire verify --checker './node_modules/.bin/tsc --noEmit | sed -E "s/\([0-9]+,[0-9]+\)//"' --link node_modules
@@ -291,7 +317,7 @@ The tool is what survived that.
 
 ## Status — read this before adopting
 
-**The mechanism works and is tested.** 72 tests across five suites, all passing (one skips below Python 3.12), including a negative-control run proving the suite can actually fail.
+**The mechanism works and is tested.** 80 tests across five suites, all passing (one skips below Python 3.12), including a negative-control run proving the suite can actually fail.
 
 **What is unknown is the frequency, not the existence.** The failure is real and easy to
 reproduce — case 2 of `tests/test_verify.sh` is exactly it: one agent renames a function,
@@ -317,10 +343,10 @@ detection, which stands on its own.
 
 ```bash
 bash tests/test_oracle.sh    # 12 cases: conflict detection vs real `git merge`
-bash tests/test_install.sh   # 16 cases: install, hooks, path resolution, concurrency
+bash tests/test_install.sh   # 18 cases: install, hooks, path resolution, concurrency, doctor diagnostics
 bash tests/test_study.sh     # 12 cases: finding IDs, randomised suppression, agent identity
 bash tests/test_setup.sh     # 14 cases: init-swarm, wire-client, HOME containment
-bash tests/test_verify.sh    # 18 cases: the semantic path — new_breakage, --link, report fields
+bash tests/test_verify.sh    # 24 cases: the semantic path — new_breakage, --link, checker coverage, report fields
 ```
 
 Every suite verifies against independent ground truth and has been shown to fail when the implementation is stubbed out. A test suite that cannot fail is worse than none.
@@ -332,7 +358,7 @@ bin/moire        the tool — a single file, Python 3.8, standard library only
 bin/moire.js     Node launcher, used only by the npm distribution
 skills/          two Agent Skills: one for acting on a finding, one for
                  setting up parallel work
-tests/           72 tests across five suites
+tests/           80 tests across five suites
 package.json     npm packaging
 README.md        this file
 LICENSE          MIT

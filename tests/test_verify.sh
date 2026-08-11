@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# test_verify.sh - Verify `moire verify`'s semantic path (V1-V18)
+# test_verify.sh - Verify `moire verify`'s semantic path (V1-V24)
 #
 # `moire check` is textual only and is covered by tests/test_oracle.sh.
 # `moire verify` additionally materialises self/peer/merged trees and runs a
@@ -15,6 +15,10 @@
 #   - `report`/`report --study` surfacing the semantic dimension (V15-V16)
 #   - no DeprecationWarning noise on Python >= 3.12 (V17)
 #   - doctor's new [warn] level for a missing dependency dir (V18)
+#   - the checker never claiming "semantic ok" about a tree it could not
+#     read, and such a record staying out of the base rate (V19-V20, V23)
+#   - per-repo checker/link from `git config`, and doctor catching an
+#     inapplicable default checker at setup time (V21-V22, V24)
 #
 # Exit 0 only if all cases pass; else exit 1 with failure count.
 
@@ -510,6 +514,38 @@ fixture_v18() {
     printf 'deps/\n' > "$repo/.gitignore"
     git_in "$repo" add -A
     git_in "$repo" commit -qm base >/dev/null 2>&1
+}
+
+# V19/V23: fixture_v2's shape in a language the builtin checker cannot read.
+# Self renames validateSession -> validateSessionV2 and updates its own
+# importer; peer adds src/service.ts importing the OLD name. File sets are
+# disjoint, so the textual merge is clean and the merged tree is genuinely
+# broken - but builtin-ast reads only Python, so it examines nothing. This
+# is the one state whose "no findings" means "no check", and reporting it
+# as "semantic ok" is the defect V19 pins.
+fixture_v19() {
+    local repo="$1"
+    init_repo "$repo"
+    mkdir -p "$repo/src"
+    printf 'export function validateSession(token: string): boolean {\n  return token.length > 0;\n}\n' > "$repo/src/auth.ts"
+    printf 'import { validateSession } from "./auth";\nexport const ok = validateSession("x");\n' > "$repo/src/main.ts"
+    printf '{"name":"ts-repro"}\n' > "$repo/package.json"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm base >/dev/null 2>&1
+    local base; base=$(git_in "$repo" rev-parse HEAD)
+
+    git_in "$repo" checkout -q -b branch_a >/dev/null 2>&1
+    printf 'export function validateSessionV2(token: string): boolean {\n  return token.length > 0;\n}\n' > "$repo/src/auth.ts"
+    printf 'import { validateSessionV2 } from "./auth";\nexport const ok = validateSessionV2("x");\n' > "$repo/src/main.ts"
+    git_in "$repo" commit -qam "self: rename validateSession -> validateSessionV2" >/dev/null 2>&1
+
+    git_in "$repo" checkout -q "$base" >/dev/null 2>&1
+    git_in "$repo" checkout -q -b branch_b >/dev/null 2>&1
+    printf 'import { validateSession } from "./auth";\nexport function service(t: string) { return validateSession(t); }\n' > "$repo/src/service.ts"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm "peer: add src/service.ts importing validateSession" >/dev/null 2>&1
+
+    git_in "$repo" checkout -q branch_a >/dev/null 2>&1
 }
 
 # === TEST CASES ===
@@ -1341,6 +1377,378 @@ test_v18_doctor_warn_missing_dep_dir() {
     fi
 }
 
+# ---- A9: the checker must never claim "semantic ok" about a tree it did
+# ---- not read, and a vacuous record must not enter the Phase 1 base rate.
+
+test_v19_ts_repro_no_semantic_claim() {
+    local num=19 name="ts-repro-no-semantic-claim"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    fixture_v19 "$repo" >/dev/null 2>&1
+
+    if ! git_in "$repo" worktree add -q "$test_dir/peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    local json rc
+    json=$(run_verify_json "$repo")
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        report_result $num "$name" "FAIL" "moire verify --json exited $rc"
+        return
+    fi
+
+    local human hrc
+    human=$(run_verify_human "$repo")
+    hrc=$?
+
+    # The string an LLM must be unable to extract from a tree nothing read.
+    local claims_ok says_unperformed says_not_verified
+    claims_ok=no
+    echo "$human" | grep -q "semantic ok" && claims_ok=yes
+    says_unperformed=no
+    echo "$human" | grep -q "no semantic check was performed" && says_unperformed=yes
+    says_not_verified=no
+    echo "$human" | grep -q "NOT semantically verified" && says_not_verified=yes
+
+    local summary
+    summary=$(python3 -c "
+import json
+r = json.loads('''$json''')[0]
+sem = r['semantic'] or {}
+cov = (sem.get('coverage') or {}).get('merged') or {}
+print(r['verdict'], sem.get('performed'), cov.get('examined'), cov.get('total'), r.get('finding_id'))
+" 2>/dev/null)
+    local verdict performed examined total fid
+    read -r verdict performed examined total fid <<<"$summary"
+
+    if [ "$rc" -eq 0 ] && [ "$hrc" -eq 0 ] && [ "$verdict" = "clean" ] \
+       && [ "$claims_ok" = "no" ] && [ "$says_unperformed" = "yes" ] \
+       && [ "$says_not_verified" = "yes" ] && [ "$performed" = "False" ] \
+       && [ "${examined:-1}" -eq 0 ] && [ "${total:-0}" -ge 3 ] && [ "$fid" = "None" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "exit=$rc/$hrc verdict=$verdict says_semantic_ok=$claims_ok says_unperformed=$says_unperformed says_not_verified=$says_not_verified performed=$performed merged_examined=$examined merged_total=$total finding_id=$fid"
+    fi
+}
+
+test_v20_python_repo_coverage_reported() {
+    local num=20 name="python-repo-coverage-reported"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+
+    # Part A - the canonical BROKEN case (fixture_v2): coverage is recorded
+    # and the fix did not perturb detection. Its human output is the BROKEN
+    # block, which by design never contains "semantic ok", so the clean-line
+    # coverage suffix is asserted in part B instead.
+    local broken_repo="$test_dir/broken_repo"
+    mkdir -p "$broken_repo"
+    fixture_v2 "$broken_repo" >/dev/null 2>&1
+    if ! git_in "$broken_repo" worktree add -q "$test_dir/broken_peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree for the broken repo"
+        return
+    fi
+
+    local json rc
+    json=$(run_verify_json "$broken_repo")
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        report_result $num "$name" "FAIL" "moire verify --json exited $rc"
+        return
+    fi
+
+    local summary
+    summary=$(python3 -c "
+import json
+r = json.loads('''$json''')[0]
+sem = r['semantic'] or {}
+cov = (sem.get('coverage') or {}).get('merged') or {}
+nb = sem.get('new_breakage') or []
+names = [(x[0] if isinstance(x, list) else x) for x in nb]
+print(sem.get('performed'), cov.get('examined'), 'peer_caller.py' in names)
+" 2>/dev/null)
+    local performed examined names_peer_caller
+    read -r performed examined names_peer_caller <<<"$summary"
+
+    # Part B - a clean Python merge (fixture_v1): "semantic ok" survives and
+    # now carries the scope it was always implicitly claiming.
+    local clean_repo="$test_dir/clean_repo"
+    mkdir -p "$clean_repo"
+    fixture_v1 "$clean_repo" >/dev/null 2>&1
+    if ! git_in "$clean_repo" worktree add -q "$test_dir/clean_peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree for the clean repo"
+        return
+    fi
+
+    local human hrc
+    human=$(run_verify_human "$clean_repo")
+    hrc=$?
+    local says_ok says_examined says_python_only
+    says_ok=no
+    echo "$human" | grep -q "semantic ok" && says_ok=yes
+    says_examined=no
+    echo "$human" | grep -q "examined" && says_examined=yes
+    says_python_only=no
+    echo "$human" | grep -q "python only" && says_python_only=yes
+
+    if [ "$performed" = "True" ] && [ "${examined:-0}" -ge 2 ] \
+       && [ "$names_peer_caller" = "True" ] && [ "$hrc" -eq 0 ] \
+       && [ "$says_ok" = "yes" ] && [ "$says_examined" = "yes" ] \
+       && [ "$says_python_only" = "yes" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "performed=$performed merged_examined=$examined names_peer_caller=$names_peer_caller clean_exit=$hrc says_semantic_ok=$says_ok says_examined=$says_examined says_python_only=$says_python_only"
+    fi
+}
+
+test_v21_git_config_checker_used_and_flag_wins() {
+    local num=21 name="git-config-checker-used-and-flag-wins"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    fixture_v6 "$repo" >/dev/null 2>&1
+
+    if ! git_in "$repo" worktree add -q "$test_dir/peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    git_in "$repo" config moire.checker 'echo cfg-finding' >/dev/null 2>&1
+
+    # No --checker: the config value is what runs. The identical line in all
+    # three trees cancels, so new_breakage == [] - which is itself proof the
+    # set difference still works through a config-sourced checker.
+    local cfg_json flag_json rc
+    cfg_json=$(run_verify_json "$repo")
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        report_result $num "$name" "FAIL" "moire verify (config checker) exited $rc"
+        return
+    fi
+    flag_json=$(run_verify_json "$repo" --checker 'echo flag-finding')
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        report_result $num "$name" "FAIL" "moire verify (--checker) exited $rc"
+        return
+    fi
+
+    local cfg_summary
+    cfg_summary=$(python3 -c "
+import json
+sem = json.loads('''$cfg_json''')[0]['semantic'] or {}
+print(sem.get('checker_source'), sem.get('new_breakage') == [], repr(sem.get('checker')))
+" 2>/dev/null)
+    local cfg_source cfg_nb_empty cfg_checker
+    read -r cfg_source cfg_nb_empty cfg_checker <<<"$cfg_summary"
+
+    local flag_summary
+    flag_summary=$(python3 -c "
+import json
+sem = json.loads('''$flag_json''')[0]['semantic'] or {}
+print(sem.get('checker_source'), repr(sem.get('checker')))
+" 2>/dev/null)
+    local flag_source flag_checker
+    read -r flag_source flag_checker <<<"$flag_summary"
+
+    # A repo with neither flag nor config still records "default".
+    local plain_repo="$test_dir/plain_repo"
+    mkdir -p "$plain_repo"
+    fixture_v6 "$plain_repo" >/dev/null 2>&1
+    if ! git_in "$plain_repo" worktree add -q "$test_dir/plain_peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree for the unconfigured repo"
+        return
+    fi
+    local plain_source
+    plain_source=$(json_get "$(run_verify_json "$plain_repo")" "semantic.checker_source" 0)
+
+    if [ "$cfg_source" = "config" ] && [ "$cfg_checker" = "'echo cfg-finding'" ] \
+       && [ "$cfg_nb_empty" = "True" ] && [ "$flag_source" = "flag" ] \
+       && [ "$flag_checker" = "'echo flag-finding'" ] && [ "$plain_source" = "default" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "config run: source=$cfg_source checker=$cfg_checker new_breakage_empty=$cfg_nb_empty; flag run: source=$flag_source checker=$flag_checker; unconfigured run: source=$plain_source"
+    fi
+}
+
+test_v22_git_config_link_and_invalid_link_refused() {
+    local num=22 name="git-config-link-and-invalid-link-refused"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    fixture_v12 "$repo" >/dev/null 2>&1
+
+    if ! git_in "$repo" worktree add -q "$test_dir/peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    mkdir -p "$repo/deps"
+    echo marker > "$repo/deps/MARKER"
+
+    # Same checker and same observable as V12, but the link comes from
+    # `git config moire.link` with NO --link flag: self_broken flips to 0 and
+    # the name appears in semantic.linked.self, exactly as the flag does.
+    git_in "$repo" config moire.link deps >/dev/null 2>&1
+    local checker='test -f deps/MARKER || echo absent'
+
+    local json rc
+    json=$(run_verify_json "$repo" --checker "$checker")
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        report_result $num "$name" "FAIL" "moire verify (config link) exited $rc"
+        return
+    fi
+
+    local self_broken linked_has_deps
+    self_broken=$(python3 -c "
+import json
+print(json.loads('''$json''')[0]['semantic']['self_broken'])
+" 2>/dev/null)
+    linked_has_deps=$(python3 -c "
+import json
+r = json.loads('''$json''')[0]
+print('yes' if 'deps' in (r['semantic'].get('linked') or {}).get('self', []) else 'no')
+" 2>/dev/null)
+
+    # An invalid config link must refuse with 2 before writing any log -
+    # the same shape as V13's flag refusal.
+    git_in "$repo" config --unset-all moire.link >/dev/null 2>&1
+    git_in "$repo" config moire.link '../evil' >/dev/null 2>&1
+
+    local log_dir="$repo/.git/moire/log"
+    local before after err rc_bad
+    before=$(find "$log_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
+    err=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" verify --checker "$checker" 2>&1 >/dev/null)
+    rc_bad=$?
+    after=$(find "$log_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
+
+    local names_key
+    names_key=no
+    echo "$err" | grep -q "moire.link" && names_key=yes
+
+    if [ "$self_broken" = "0" ] && [ "$linked_has_deps" = "yes" ] && [ "$rc_bad" -eq 2 ] \
+       && [ -n "$err" ] && [ "$names_key" = "yes" ] && [ "$after" = "$before" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "config link: self_broken=$self_broken linked_has_deps=$linked_has_deps; invalid: exit=$rc_bad stderr_names_moire.link=$names_key log_unchanged=$([ "$after" = "$before" ] && echo yes || echo no)"
+    fi
+}
+
+test_v23_report_excludes_unperformed() {
+    local num=23 name="report-excludes-unperformed"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+
+    local ts_repo="$test_dir/ts_repo"
+    mkdir -p "$ts_repo"
+    fixture_v19 "$ts_repo" >/dev/null 2>&1
+    if ! git_in "$ts_repo" worktree add -q "$test_dir/ts_peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree for the TS repo"
+        return
+    fi
+    if ! (cd "$ts_repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" verify --json >/dev/null 2>&1); then
+        report_result $num "$name" "SKIP" "moire verify failed on the TS repo"
+        return
+    fi
+
+    local ts_report ts_study ts_human
+    ts_report=$(cd "$ts_repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report --json 2>/dev/null)
+    ts_study=$(cd "$ts_repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report --study --json 2>/dev/null)
+    ts_human=$(cd "$ts_repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report 2>/dev/null)
+
+    local summary
+    summary=$(python3 -c "
+import json
+d = json.loads('''$ts_report''')
+s = json.loads('''$ts_study''')
+print(d.get('unperformed_semantic_checks'), d.get('semantic_pairs'),
+      d.get('semantic_rate'), s.get('unperformed_semantic_checks'))
+" 2>/dev/null)
+    local unperformed pairs rate study_unperformed
+    read -r unperformed pairs rate study_unperformed <<<"$summary"
+
+    local human_na
+    human_na=no
+    echo "$ts_human" | grep -q "semantic rate (clean merges that break) : n/a" && human_na=yes
+
+    # A performed record still counts: the exclusion is targeted, not blanket.
+    local py_repo="$test_dir/py_repo"
+    mkdir -p "$py_repo"
+    fixture_v2 "$py_repo" >/dev/null 2>&1
+    if ! git_in "$py_repo" worktree add -q "$test_dir/py_peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree for the Python repo"
+        return
+    fi
+    if ! (cd "$py_repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" verify --json >/dev/null 2>&1); then
+        report_result $num "$name" "SKIP" "moire verify failed on the Python repo"
+        return
+    fi
+    local py_report py_pairs
+    py_report=$(cd "$py_repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report --json 2>/dev/null)
+    py_pairs=$(json_get "$py_report" "semantic_pairs" 0)
+
+    if [ "${unperformed:-0}" -ge 1 ] && [ "${pairs:-1}" -eq 0 ] && [ "$rate" = "None" ] \
+       && [ "$human_na" = "yes" ] && [ "${study_unperformed:-0}" -ge 1 ] \
+       && [ -n "$py_pairs" ] && [ "$py_pairs" -ge 1 ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "ts: unperformed=$unperformed semantic_pairs=$pairs semantic_rate=$rate human_na=$human_na study_unperformed=$study_unperformed; python: semantic_pairs=$py_pairs"
+    fi
+}
+
+test_v24_doctor_checker_applicability() {
+    local num=24 name="doctor-checker-applicability"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+
+    # A repo with no tracked .py files and no configured checker: warn.
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    fixture_v18 "$repo" >/dev/null 2>&1
+
+    local out_warn rc_warn
+    out_warn=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" doctor 2>&1)
+    rc_warn=$?
+
+    local warn_line names_no_py
+    warn_line=$(echo "$out_warn" | grep '^\[warn\] verify checker')
+    names_no_py=no
+    echo "$warn_line" | grep -qF "no .py files" && names_no_py=yes
+
+    # Configuring a checker resolves it, and [warn] never moved the exit code.
+    git_in "$repo" config moire.checker 'x' >/dev/null 2>&1
+    local out_cfg rc_cfg cfg_line
+    out_cfg=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" doctor 2>&1)
+    rc_cfg=$?
+    cfg_line=$(echo "$out_cfg" | grep '^\[ok\] verify checker configured')
+
+    # A Python repo needs no configuration: the default applies.
+    local py_repo="$test_dir/py_repo"
+    mkdir -p "$py_repo"
+    fixture_v2 "$py_repo" >/dev/null 2>&1
+    local py_line
+    py_line=$(cd "$py_repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" doctor 2>&1 |
+              grep '^\[ok\] verify checker - builtin-ast (default) applies')
+
+    if [ -n "$warn_line" ] && [ "$names_no_py" = "yes" ] && [ -n "$cfg_line" ] \
+       && [ -n "$py_line" ] && [ "$rc_cfg" = "$rc_warn" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "warn_line_present=$([ -n "$warn_line" ] && echo yes || echo no) names_no_py=$names_no_py ok_configured_line=$([ -n "$cfg_line" ] && echo yes || echo no) python_default_line=$([ -n "$py_line" ] && echo yes || echo no) exit_warn=$rc_warn exit_configured=$rc_cfg"
+    fi
+}
+
 # === MAIN ===
 
 main() {
@@ -1378,6 +1786,12 @@ main() {
     test_v16_report_skipped_semantic_checks
     test_v17_no_deprecation_warning
     test_v18_doctor_warn_missing_dep_dir
+    test_v19_ts_repro_no_semantic_claim
+    test_v20_python_repo_coverage_reported
+    test_v21_git_config_checker_used_and_flag_wins
+    test_v22_git_config_link_and_invalid_link_refused
+    test_v23_report_excludes_unperformed
+    test_v24_doctor_checker_applicability
 
     # Print summary
     local total=$((PASSED + FAILED + SKIPPED))

@@ -40,6 +40,30 @@ worth interrupting yourself for.
 either branch alone is excluded, so a `BROKEN` finding is never someone's pre-existing
 problem.
 
+## A third outcome: `no semantic check was performed`
+
+```
+clean   with /repo-agent-b (textual only - no semantic check was performed)
+  builtin-ast examined 0 of 847 files: it reads only Python and this tree has no .py files.
+  The merged result was NOT semantically verified - "clean" above means only that git found no textual conflict.
+```
+
+This is neither `CONFLICT` nor `BROKEN` nor a pass. `verify` gave **no semantic
+answer at all** — the default checker reads Python and this repository has none for it
+to read. Treat it as *"verify was unavailable"*, exactly as you would a tool that
+failed to run. It is never *"verify passed"*: the merged result was not examined, so
+the `BROKEN` case above would have been invisible.
+
+**Do not improvise a checker mid-task.** A `--checker` command that is
+nondeterministic, prints a summary line, or emits absolute paths manufactures false
+breakage rather than silence, and you will act on it. Choosing one correctly is a
+setup decision, not something to guess at while working.
+
+What to do instead: finish and report the gap to whoever dispatched you — the repo
+needs `git config moire.checker '<command>'` set once, and `moire doctor` says so.
+State plainly that your work was checked textually but not semantically, rather than
+reporting it as verified.
+
 ## The arbiter line
 
 `arbiter: self yields` is a **recommendation**, computed from facts observable in both

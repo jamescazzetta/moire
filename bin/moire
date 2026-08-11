@@ -14,7 +14,13 @@ Load-bearing facts:
     through GIT_INDEX_FILE, so even a held index.lock does not stop us.
 
 Note: snapshot trees/commits are written into the repo's own object store. They are
-refless and reclaimed by `git gc`. No alternates scheme by design (phase 0 simplicity).
+refless, deterministic (fixed committer date, so an unchanged worktree re-snapshots
+to the same OIDs and writes nothing), and reclaimed by git's own housekeeping
+(`git maintenance` / `git gc`, which normal commit and fetch activity already
+triggers). moire never deletes an object. No alternates scheme by design (phase 0
+simplicity): a quarantined object store needs a per-worktree GIT_DIR to resolve HEAD
+correctly, duplicates every object the agent goes on to commit, and makes the
+`merged_tree` OIDs moire prints unreadable with a plain `git archive`.
 
 Python 3.8 compatible, stdlib only.
 """
@@ -37,6 +43,7 @@ SNAPSHOT_ENV = {
     "GIT_AUTHOR_NAME": "moire", "GIT_AUTHOR_EMAIL": "moire@localhost",
     "GIT_COMMITTER_NAME": "moire", "GIT_COMMITTER_EMAIL": "moire@localhost",
 }
+
 HOOK_MARKER = "# >>> moire hook >>>"
 HOOKS = ("post-commit", "post-merge")
 DEFAULT_CACHE_TTL = 2.0
@@ -217,7 +224,16 @@ def snapshot(git, wt):
             os.unlink(tmpidx)
         env = {"GIT_INDEX_FILE": tmpidx}
         env.update(SNAPSHOT_ENV)
-        git(["add", "-A"], cwd=wt, env=env)
+        # `add -A` is what makes this a snapshot of the WORKING TREE rather
+        # than of HEAD, so its failure is not cosmetic: the copied index would
+        # simply keep the committed state, write-tree would return a stale but
+        # perfectly valid tree, commit-tree would succeed, and the caller would
+        # get a confident verdict computed against a tree missing everything
+        # the agent just wrote. That is the one error the cache note below
+        # calls out as silently producing a wrong answer, so it is raised here
+        # and becomes verdict "error" - still warn-only, still exit 0, but
+        # never a wrong "clean".
+        git(["add", "-A"], cwd=wt, env=env, check=True)
         tree = git.out(["write-tree"], cwd=wt, env=env)
         if not tree:
             raise RuntimeError("write-tree produced no output for %s" % wt)
@@ -389,6 +405,16 @@ def materialize_tree(git, cwd, tree_oid, dest):
                            (tree_oid, err2.decode("utf-8", "replace").strip()))
 
 
+def _valid_link_name(name):
+    """A link name must be a single path component: it is joined onto both a
+    real worktree and a materialised temporary tree, so anything that can
+    traverse out of either ('/', '\\', '.', '..') is refused rather than
+    normalised. One predicate for both sources of names - the `--link` flag
+    and `git config moire.link` - so the two can never disagree.
+    """
+    return bool(name) and "/" not in name and "\\" not in name and name not in (".", "..")
+
+
 def link_directories(dest, source_worktree, names):
     """Symlink user-named directories from a real worktree into a materialised
     tree. `git archive` emits tracked files only, so a gitignored dependency
@@ -529,15 +555,26 @@ def _resolves(mod, name, mm, cache):
 
 
 def _broken_in_tree(root):
-    """-> set of (rel_path, module, name) that cannot resolve INSIDE this tree."""
+    """-> (set of (rel_path, module, name) that cannot resolve INSIDE this tree,
+    py_files_examined, files_total). The counts come from the same walk that
+    finds breakage: py_files_examined counts every .py encountered (parsable or
+    not - an unparsable file was still examined and judgement withheld);
+    files_total counts every file surviving the _BK_SKIP_DIRS pruning. Zero
+    examined in a tree is the one state whose "no findings" means "no check",
+    and the caller must be able to tell those apart.
+    """
     mm = _module_map(root)
     cache = {}
     out = set()
+    py_examined = 0
+    files_total = 0
     for dp, dn, fn in os.walk(root):
         dn[:] = [d for d in dn if d not in _BK_SKIP_DIRS]
+        files_total += len(fn)
         for f in fn:
             if not f.endswith(".py"):
                 continue
+            py_examined += 1
             full = os.path.join(dp, f)
             try:
                 src = open(full, "r", encoding="utf-8", errors="replace").read()
@@ -570,7 +607,7 @@ def _broken_in_tree(root):
                             continue
                         if not _resolves(mod, name, mm, cache):
                             out.add((rel, mod, name))
-    return out
+    return out, py_examined, files_total
 
 
 DEFAULT_CHECKER_TIMEOUT = 60.0
@@ -590,18 +627,28 @@ def checker_timeout():
 def run_checker(checker, directory, timeout):
     """Run the builtin AST checker, or an arbitrary shell command, over `directory`.
 
-    -> frozenset of findings: (path, module, name) tuples for the builtin
+    -> (findings, coverage).
+
+    findings is a frozenset: (path, module, name) tuples for the builtin
     checker, one string per non-blank stdout line for an external command. A
     nonzero exit with no stdout still counts as broken (via a fixed sentinel)
     so it participates correctly in the broken(merged)-broken(self)-broken(peer)
     set difference - equally-broken-everywhere cancels out instead of being
     misread as zero findings on every side.
 
+    coverage is {"examined": int, "total": int} for the builtin checker - the
+    count of .py files it read and of all files in the tree - and None for an
+    external command, which has no channel to report one (its stdout lines are
+    findings by contract). None means "the user explicitly configured this
+    checker and owns its applicability"; 0 means "the default checker proved it
+    could read nothing here".
+
     Raises on timeout (subprocess.TimeoutExpired) or spawn failure; callers
     must turn that into verdict "error", never into breakage.
     """
     if checker == "builtin-ast":
-        return frozenset(_broken_in_tree(directory))
+        broken, examined, total = _broken_in_tree(directory)
+        return frozenset(broken), {"examined": examined, "total": total}
     p = subprocess.Popen(checker, shell=True, cwd=directory,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
@@ -613,7 +660,7 @@ def run_checker(checker, directory, timeout):
     lines = set(ln for ln in out.decode("utf-8", "replace").split("\n") if ln.strip())
     if p.returncode != 0 and not lines:
         lines.add(NONZERO_NO_OUTPUT)
-    return frozenset(lines)
+    return frozenset(lines), None
 
 
 # ------------------------------------------------------------------ finding id
@@ -1172,7 +1219,8 @@ def cmd_verify(git, argv):
     """
     as_json = "--json" in argv
     peers_arg = None
-    checker = "builtin-ast"
+    checker = None                    # resolved below: flag > git config > builtin-ast
+    checker_source = None
     if "--peers" in argv:
         i = argv.index("--peers")
         if i + 1 < len(argv):
@@ -1191,7 +1239,7 @@ def cmd_verify(git, argv):
                 return 2              # refuse; write no log
             links.append(argv[i + 1])
     for name in links:
-        if not name or "/" in name or "\\" in name or name in (".", ".."):
+        if not _valid_link_name(name):
             sys.stderr.write("moire: --link %r: name must be a single path component "
                              "(no '/', '\\', '.' or '..')\n" % name)
             return 2                  # refuse; write no log
@@ -1206,6 +1254,35 @@ def cmd_verify(git, argv):
         return 2
     top = os.path.realpath(top)
     cd = common_dir(git, cwd)
+
+    # Per-repo execution context, from `git config`, NOT from a committed file.
+    # `.git/config` is never cloned, so a checkout cannot carry a command; and
+    # it lives in $GIT_COMMON_DIR, so one `git config moire.checker ...` covers
+    # every worktree of the swarm and every agent need only type `moire
+    # verify`. Setting it requires local write access to the clone - the same
+    # trust level as installing moire's hooks, and the deliberate contrast with
+    # the repo-controlled auto-executed code `doctor` warns about for
+    # core.hooksPath. Precedence: --checker flag > moire.checker > builtin-ast;
+    # `--checker builtin-ast` stays expressible to override a config back to
+    # the default. Links are the union of flag occurrences and config entries,
+    # flag order first, deduped.
+    if checker is not None:
+        checker_source = "flag"
+    else:
+        cfg = git.out(["config", "--get", "moire.checker"], cwd=cwd)
+        if cfg:
+            checker, checker_source = cfg, "config"
+        else:
+            checker, checker_source = "builtin-ast", "default"
+    rc_l, out_l, _err_l = git(["config", "--get-all", "moire.link"], cwd=cwd)
+    for name in ([ln.strip() for ln in out_l.split("\n") if ln.strip()]
+                 if rc_l == 0 else []):
+        if not _valid_link_name(name):
+            sys.stderr.write("moire: git config moire.link %r: name must be a single path "
+                             "component (no '/', '\\', '.' or '..')\n" % name)
+            return 2                  # refuse; write no log - same shape as the flag refusal
+        if name not in links:
+            links.append(name)
 
     wts = list_worktrees(git, cwd)
     me = None
@@ -1257,7 +1334,7 @@ def cmd_verify(git, argv):
     # 3N -> 2N+1). Lazy so nothing is materialised at all when every peer
     # errors out before its semantic pass. Memoised only on success: a failed
     # self check is retried per peer, exactly like the old per-peer behaviour.
-    self_state = {"dir": None, "broken": None, "linked": []}
+    self_state = {"dir": None, "broken": None, "linked": [], "coverage": None}
 
     def _self_checked():
         if self_state["broken"] is None:
@@ -1265,7 +1342,7 @@ def cmd_verify(git, argv):
             try:
                 materialize_tree(git, top, my_tree, d)
                 self_linked = link_directories(d, top, links)
-                broken = run_checker(checker, d, timeout)
+                broken, cov = run_checker(checker, d, timeout)
             except BaseException:     # KeyboardInterrupt too: self_state["dir"] is
                                       # still None here, so the outer finally would
                                       # never see this directory - clean it now.
@@ -1274,6 +1351,7 @@ def cmd_verify(git, argv):
             self_state["dir"] = d
             self_state["broken"] = broken
             self_state["linked"] = self_linked
+            self_state["coverage"] = cov
         return self_state["broken"]
 
     try:
@@ -1344,8 +1422,8 @@ def cmd_verify(git, argv):
                     # approximation - see link_directories).
                     peer_linked = link_directories(peer_dir, p["worktree"], links)
                     merged_linked = link_directories(merged_dir, top, links)
-                    peer_broken = run_checker(checker, peer_dir, timeout)
-                    merged_broken = run_checker(checker, merged_dir, timeout)
+                    peer_broken, peer_cov = run_checker(checker, peer_dir, timeout)
+                    merged_broken, merged_cov = run_checker(checker, merged_dir, timeout)
                     new_breakage = merged_broken - self_broken - peer_broken
                     excluded = 0
                     if verdict == "conflict":
@@ -1369,8 +1447,27 @@ def cmd_verify(git, argv):
                     # sort key is safe.
                     nb = [list(x) if isinstance(x, tuple) else x for x in new_breakage]
                     nb.sort(key=lambda x: [str(e) for e in x] if isinstance(x, list) else [x])
+                    # The builtin checker reports how much of the tree it could
+                    # read; an external checker has no channel to (coverage is
+                    # None) and its applicability is the user's explicit choice.
+                    # `performed` keys on the MERGED tree only - that is the tree
+                    # the top-level claim is about. A peer adding the repo's
+                    # first .py file gives self coverage 0 / merged coverage 1,
+                    # and self_broken == 0 is then genuinely true (no imports
+                    # exist to break), so the set difference stays exact.
+                    performed = (merged_cov is None) or (merged_cov["examined"] > 0)
                     rec["semantic"] = {
                         "checker": checker,
+                        "checker_source": checker_source,
+                        # Stored, not derived at read time: this is the
+                        # load-bearing bit for the Phase 1 base rate, and
+                        # `report` must not be able to misderive it.
+                        "performed": performed,
+                        "coverage": None if merged_cov is None else {
+                            "self": self_state["coverage"],
+                            "peer": peer_cov,
+                            "merged": merged_cov,
+                        },
                         "merged_tree": merged_tree,
                         "new_breakage": nb,
                         "self_broken": len(self_broken),
@@ -1446,6 +1543,14 @@ def cmd_verify(git, argv):
                     sys.stdout.write("  semantic check not attempted: external checker cannot be "
                                      "trusted on a tree containing conflict markers "
                                      "(%d conflicting paths)\n" % len(r["conflict_paths"]))
+                elif not sem.get("performed", True):
+                    # The builtin ran but could read nothing: say so instead of
+                    # letting the silence read as "semantically fine".
+                    mcov = (sem.get("coverage") or {}).get("merged") or {}
+                    sys.stdout.write(
+                        "  semantic check not performed: builtin-ast examined 0 of %d files in "
+                        "the merged tree (it reads only Python; this tree has no .py files)\n"
+                        % mcov.get("total", 0))
                 for pth in r["conflict_paths"]:
                     sys.stdout.write("    %s\n" % pth)
                 for note in r.get("peer_notes") or []:
@@ -1484,10 +1589,43 @@ def cmd_verify(git, argv):
                     if arb:
                         sys.stdout.write("  arbiter: %s yields (%s)\n" % (arb["yield"], arb["reason"]))
                 else:
-                    sys.stdout.write(
-                        "clean   with %s (semantic ok: self=%d peer=%d merged=%d broken)\n" %
-                        (peer, sem.get("self_broken", 0), sem.get("peer_broken", 0),
-                         sem.get("merged_broken", 0)))
+                    # The leading token stays `clean`: the textual verdict IS
+                    # clean and true, and it is the grammar `check` shares. What
+                    # was false was the parenthetical claim, so the claim moves
+                    # to where the truth is - on the same line, the same
+                    # precedent as the not-attempted line above. An LLM reads
+                    # the whole line; what it must be unable to extract from a
+                    # tree nothing could read is the string "semantic ok".
+                    cov = sem.get("coverage") or {}
+                    mcov = cov.get("merged") or {}
+                    if not sem.get("performed", True):
+                        sys.stdout.write(
+                            "clean   with %s (textual only - no semantic check was performed)\n"
+                            % peer)
+                        sys.stdout.write(
+                            "  builtin-ast examined 0 of %d files: it reads only Python and this "
+                            "tree has no .py files.\n" % mcov.get("total", 0))
+                        sys.stdout.write(
+                            "  The merged result was NOT semantically verified - \"clean\" above "
+                            "means only that git found no textual conflict.\n")
+                        sys.stdout.write(
+                            "  To enable semantic verification for this repo: "
+                            "git config moire.checker '<command>'   "
+                            "(README: the --checker contract)\n")
+                    elif mcov:
+                        sys.stdout.write(
+                            "clean   with %s (semantic ok: self=%d peer=%d merged=%d broken; "
+                            "builtin-ast examined %d of %d files - python only)\n" %
+                            (peer, sem.get("self_broken", 0), sem.get("peer_broken", 0),
+                             sem.get("merged_broken", 0),
+                             mcov.get("examined", 0), mcov.get("total", 0)))
+                    else:
+                        # External checker (or a pre-coverage record): no
+                        # coverage channel exists, so claim nothing about scope.
+                        sys.stdout.write(
+                            "clean   with %s (semantic ok: self=%d peer=%d merged=%d broken)\n" %
+                            (peer, sem.get("self_broken", 0), sem.get("peer_broken", 0),
+                             sem.get("merged_broken", 0)))
     return 0                          # warn-only: always 0
 
 
@@ -1626,6 +1764,96 @@ def cmd_doctor(git, argv):
         say(False, "state dir writable", str(ex))
     if writable:
         say(True, "state dir writable", ld)
+
+    # The one operation everything else depends on, exercised for real rather
+    # than assumed. `check` and `verify` are warn-only by design: a snapshot
+    # that fails is caught, recorded as verdict "error", and exits 0 - so a
+    # universally failing snapshot (an unwritable object store, a git that
+    # rejects the fixed SNAPSHOT_ENV dates, a broken index) turns moire into a
+    # silent no-op rather than anything anyone would notice. Containment is not
+    # detectability; this line is where that failure becomes visible.
+    #
+    # [FAIL], not [warn]: unlike every other check here, nothing works after
+    # this one breaks. Uses the same never-mutate path as check/verify - a copy
+    # of the index, discarded - so running doctor changes nothing observable.
+    if top:
+        try:
+            t_probe, c_probe = snapshot(git, top)
+            if not t_probe or not c_probe:
+                raise RuntimeError("empty tree or commit id")
+            say(True, "snapshot works", "tree %s" % t_probe[:12])
+        except Exception as ex:
+            say(False, "snapshot works",
+                "%s - check/verify would report verdict 'error' for every peer "
+                "and still exit 0" % ex)
+
+    # Object-store pressure. Snapshot commits are content-addressed (SNAPSHOT_ENV
+    # pins the dates), so an idle swarm writes nothing; what remains is one
+    # blob/tree/commit set per distinct observed state, all of it refless and
+    # therefore reclaimable by git's own housekeeping - which normal commit/merge/
+    # fetch activity already triggers. This line exists for the pessimistic case:
+    # a git old enough that the auto-sweep packs reachable objects only, or a
+    # workflow that genuinely never commits.
+    #
+    # Threshold is git's own `gc.auto` (default 6700), not a moire invention, so
+    # `gc.auto=0` - the user explicitly disabling gc - disables this warn too,
+    # matching git's meaning. Advisory only: git's real trigger is an estimate
+    # from one fanout directory, so the true loose count crossing gc.auto is a
+    # proxy for "gc has work to do", not a prediction of when it fires.
+    #
+    # [warn], never [FAIL] - a full object store is not a broken install, and
+    # doctor is diagnostic: it names the command, it never runs gc itself.
+    loose = None
+    co = git.out(["count-objects", "-v"], cwd=cwd)
+    for ln in (co or "").split("\n"):
+        if ln.startswith("count:"):
+            try:
+                loose = int(ln.split()[1])
+            except (IndexError, ValueError):
+                pass
+    thr = 6700
+    t = git.out(["config", "--get", "gc.auto"], cwd=cwd)
+    if t:
+        try:
+            thr = int(t)
+        except ValueError:
+            pass
+    if loose is None:
+        pass                          # count-objects failed: say nothing, not a health claim
+    elif thr > 0 and loose >= thr:
+        say("warn", "loose objects",
+            "%d in .git/objects (>= gc.auto %d) - moire's snapshot objects are "
+            "refless and reclaimed by git housekeeping; run `git gc` to sweep now"
+            % (loose, thr))
+    elif thr > 0:
+        say(True, "loose objects", "%d (gc.auto %d)" % (loose, thr))
+    else:
+        say(True, "loose objects", "%d (gc.auto disabled)" % loose)
+
+    # Catch at setup time the state `verify` would otherwise only reveal per
+    # invocation: the default checker reads Python, so on a repo with no
+    # tracked .py files `moire verify` performs no semantic check at all.
+    # [warn], never [FAIL] - `check` and textual `verify` remain fully usable,
+    # matching the dependency-dirs precedent below. `git ls-files -- '*.py'` is
+    # a suffix census matching nested paths, not language semantics: exactly
+    # the knowledge builtin-ast already embodies, and no package-manager
+    # knowledge is added anywhere.
+    chk = git.out(["config", "--get", "moire.checker"], cwd=cwd)
+    if chk:
+        lk = git.out(["config", "--get-all", "moire.link"], cwd=cwd)
+        say(True, "verify checker configured",
+            chk + ((" (links: %s)" % ", ".join(lk.split("\n"))) if lk else ""))
+    else:
+        n_py = len([l for l in (git.out(["ls-files", "--", "*.py"], cwd=cwd) or "").split("\n")
+                    if l.strip()])
+        if n_py:
+            say(True, "verify checker",
+                "builtin-ast (default) applies - %d tracked .py files" % n_py)
+        else:
+            say("warn", "verify checker",
+                "builtin-ast (default) reads only Python and this repo tracks no .py files - "
+                "`moire verify` will perform no semantic check until one is set: "
+                "git config moire.checker '<cmd>' (README: the --checker contract)")
 
     wts = list_worktrees(git, cwd)
     say(True, "worktrees discoverable", "%d found" % len(wts))
@@ -2270,6 +2498,17 @@ def _semantic_skipped(rec):
     return "semantic" in rec and rec["semantic"] is None and rec.get("verdict") == "conflict"
 
 
+def _semantic_unperformed(rec):
+    """-> True when a verify record's checker ran but could read nothing
+    (builtin-ast on a tree with no .py files). Not a clean semantic pair and
+    not a skipped one: the merge was textually evaluated, its semantics never
+    checked. Excluded from semantic_rate's denominator - a vacuous pass must
+    not drag the Phase 1 rate toward zero. Pre-fix records lack the key and
+    default to performed."""
+    sem = rec.get("semantic")
+    return isinstance(sem, dict) and sem.get("performed", True) is False
+
+
 def _semantic_under_conflict_finding(rec):
     """-> True for a verify record whose builtin checker ran UNDER a textual
     conflict and found breakage on files disjoint from it. One shared
@@ -2406,6 +2645,10 @@ def _report_study(records, as_json):
         # textually - without this, kind_split silently under-reports the
         # semantic dimension (a skipped check is not a clean one).
         "skipped_semantic_checks": sum(1 for r in records if _semantic_skipped(r)),
+        # Records whose checker ran but could read nothing. Distinct from
+        # skipped (a textual conflict pre-empted the pass) and from clean:
+        # nothing was measured, so they belong in no rate at all.
+        "unperformed_semantic_checks": sum(1 for r in records if _semantic_unperformed(r)),
         # Builtin-checker breakage found UNDER a textual conflict, on files
         # disjoint from it. Same predicate as `report`, so the two commands
         # count the same records; excluded from any rate (not clean merges).
@@ -2450,6 +2693,8 @@ def _report_study(records, as_json):
                      study["skipped_semantic_checks"])
     sys.stdout.write("  semantic findings under conflict (disjoint breakage; not in any rate): %d\n" %
                      study["semantic_findings_under_conflict"])
+    sys.stdout.write("  semantic checks not performed (checker could read nothing; not in any rate): %d\n" %
+                     study["unperformed_semantic_checks"])
 
     return 0
 
@@ -2487,13 +2732,19 @@ def cmd_report(git, argv):
     # under_conflict records are excluded from the rate: they are not clean
     # merges, and the published kill criterion is about clean merges. Their
     # findings are surfaced separately below so nothing is discarded.
+    # A record whose checker could read nothing (builtin-ast on a tree with no
+    # .py files) is excluded too: it measured nothing, so counting it as a
+    # clean semantic pair would bias the rate toward zero on exactly the repos
+    # where nothing was checked. Counted separately, never discarded.
     semantic_pairs = [r for r in records
                       if isinstance(r.get("semantic"), dict)
-                      and not r["semantic"].get("under_conflict")]
+                      and not r["semantic"].get("under_conflict")
+                      and r["semantic"].get("performed", True)]
     semantic_breakages = [r for r in semantic_pairs if r["semantic"].get("new_breakage")]
     semantic_rate = (float(len(semantic_breakages)) / len(semantic_pairs)) if semantic_pairs else None
     under_conflict_findings = [r for r in records if _semantic_under_conflict_finding(r)]
     skipped_semantic = sum(1 for r in records if _semantic_skipped(r))
+    unperformed_semantic = sum(1 for r in records if _semantic_unperformed(r))
 
     if as_json:
         sys.stdout.write(json.dumps({
@@ -2506,6 +2757,7 @@ def cmd_report(git, argv):
             "semantic_rate": semantic_rate,
             "semantic_findings_under_conflict": len(under_conflict_findings),
             "skipped_semantic_checks": skipped_semantic,
+            "unperformed_semantic_checks": unperformed_semantic,
         }, indent=2) + "\n")
         return 0
 
@@ -2527,6 +2779,8 @@ def cmd_report(git, argv):
         sys.stdout.write("semantic rate (clean merges that break) : %.1f%%\n" % (100.0 * semantic_rate))
     sys.stdout.write("semantic findings under conflict        : %d\n" % len(under_conflict_findings))
     sys.stdout.write("skipped semantic checks    : %d\n" % skipped_semantic)
+    sys.stdout.write("semantic checks not performed (checker examined 0 files) : %d\n"
+                     % unperformed_semantic)
     if top_paths:
         sys.stdout.write("\ntop contested paths:\n")
         for p, n in top_paths:
@@ -2544,6 +2798,7 @@ moire - observed-diff conflict detection between concurrent git worktrees
                                     --link symlinks a named untracked directory (e.g.
                                     node_modules) from each worktree into its materialised
                                     tree so external checkers can resolve dependencies
+                                    without either flag, reads the git config keys below
   moire explain <finding_id> <text...> file a display-only note against a finding id (never gates a verdict)
   moire doctor                         verify git version, hooks, install, state dir
   moire install [--print-client-hooks] install git hooks into $GIT_COMMON_DIR/hooks/
@@ -2567,6 +2822,15 @@ Env vars:
                     split for a new study window
   MOIRE_AGENT_ID       string, default unset - a label recorded alongside each check/verify
                     record for cross-agent vs same-agent analysis; never affects a verdict
+
+Git config keys (read by `verify`; `.git/config` is never cloned, so a checkout
+cannot carry a command, and one setting covers every worktree of the repo):
+  moire.checker        string, default unset - the checker command, as `--checker`.
+                    Precedence: --checker flag > moire.checker > builtin-ast.
+                       git config moire.checker '<cmd>'
+  moire.link           string, repeatable - a directory to link, as `--link`. Links are
+                    the union of flag occurrences and config entries.
+                       git config --add moire.link <name>
 
 Warn-only by design: `check` and `verify` never exit nonzero because of a
 finding; they refuse with 2 on an unusable environment or a bad argument,

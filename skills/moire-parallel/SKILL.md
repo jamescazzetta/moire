@@ -37,6 +37,20 @@ do not symlink a shared `node_modules`, `.venv`, or `vendor` across worktrees to
 skip the step. Concurrent agents would then be mutating each other's dependencies,
 which is exactly the class of interference moire exists to detect.
 
+**If the repository is not Python, configure the checker once, before dispatching
+anyone.** `moire verify`'s default checker reads Python only; on any other repository
+it examines nothing and reports `no semantic check was performed` — every agent then
+finishes its task with the semantic dimension unchecked.
+
+```bash
+git config moire.checker '<cmd>'          # e.g. a type checker; see the --checker contract
+git config --add moire.link node_modules  # a gitignored dir the checker needs
+moire doctor                              # warns when `verify` would have nothing to read
+```
+
+`.git/config` is shared by every worktree and never travels with a clone, so one
+setting covers the whole swarm and each agent only ever types `moire verify`.
+
 If `moire doctor` reports the client hook is not wired, run this once — it prints a
 diff first and writes nothing until `--apply`:
 

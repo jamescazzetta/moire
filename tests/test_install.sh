@@ -140,6 +140,33 @@ is_valid_json_array() {
 	python3 -c "import json, sys; json.load(open('$file')); print('valid')" 2>/dev/null | grep -q "valid"
 }
 
+# Helper: count of LOOSE objects in the repo's object store.
+# `git count-objects -v` prints "count: <n>" for loose objects (as opposed to
+# "in-pack:"), which is exactly the population moire's snapshots add to.
+loose_object_count() {
+	"$MOIRE_GIT" count-objects -v | awk '/^count:/{print $2}'
+}
+
+# Helper: "<worktree> <tree> <commit>" for every snapshot-cache entry, sorted.
+# The snapshot COMMIT oid is not carried in any log record (records hold tree
+# oids only), so the cache under $GIT_COMMON_DIR/moire/cache is the one place
+# it is observable from outside the process that computed it.
+snapshot_oid_map() {
+	local common_dir=$1
+	python3 - "$common_dir/moire/cache" <<'PY'
+import glob, json, os, sys
+rows = []
+for p in sorted(glob.glob(os.path.join(sys.argv[1], "*.json"))):
+    try:
+        with open(p) as f:
+            r = json.load(f)
+    except Exception:
+        continue
+    rows.append("%s %s %s" % (r.get("worktree"), r.get("tree"), r.get("commit")))
+print("\n".join(sorted(rows)))
+PY
+}
+
 # ============================================================================
 # Early exits
 # ============================================================================
@@ -665,6 +692,64 @@ test_016() {
 	rm -rf "$tmpdir"
 }
 
+# TEST 19: doctor reports object-store pressure against git's own gc.auto
+#
+# Observational only: a full object store is not a broken install, so the line
+# is [warn] and must leave doctor's exit code alone. The threshold is git's own
+# `gc.auto`, which means setting it to 0 -- the user explicitly disabling gc --
+# must silence the warn rather than pin it on.
+test_019() {
+	local tmpdir=$(setup_test_repo)
+	TEMP_DIRS+=("$tmpdir")
+	cd "$tmpdir"
+
+	"$MOIRE_BIN" install > /dev/null 2>&1
+
+	local out_ok rc_ok=0
+	out_ok=$("$MOIRE_BIN" doctor 2>&1) || rc_ok=$?
+
+	# Far below the default threshold: an [ok] line, no warn.
+	if ! echo "$out_ok" | grep -q '^\[ok\] loose objects'; then
+		log_test 019 FAIL "healthy repo: expected an [ok] loose objects line"
+		rm -rf "$tmpdir"
+		return
+	fi
+
+	"$MOIRE_GIT" config gc.auto 5
+	local i
+	for i in 1 2 3 4 5 6; do
+		echo "junk $i" | "$MOIRE_GIT" hash-object -w --stdin > /dev/null
+	done
+
+	local out_warn rc_warn=0
+	out_warn=$("$MOIRE_BIN" doctor 2>&1) || rc_warn=$?
+
+	if ! echo "$out_warn" | grep -q '^\[warn\] loose objects'; then
+		log_test 019 FAIL "over gc.auto: expected a [warn] loose objects line, got: $(echo "$out_warn" | grep 'loose objects')"
+		rm -rf "$tmpdir"
+		return
+	fi
+	if [[ $rc_warn -ne 0 ]]; then
+		log_test 019 FAIL "the warn changed doctor's exit code (rc=$rc_warn) on an otherwise healthy repo"
+		rm -rf "$tmpdir"
+		return
+	fi
+
+	"$MOIRE_GIT" config gc.auto 0
+	local out_off rc_off=0
+	out_off=$("$MOIRE_BIN" doctor 2>&1) || rc_off=$?
+
+	if echo "$out_off" | grep -q '^\[warn\] loose objects'; then
+		log_test 019 FAIL "gc.auto=0 (gc disabled by the user) should silence the warn"
+	elif [[ $rc_off -ne 0 ]]; then
+		log_test 019 FAIL "doctor exit code changed with gc.auto=0 (rc=$rc_off)"
+	else
+		log_test 019 PASS "doctor warns past gc.auto, honours gc.auto=0, never changes exit code"
+	fi
+
+	rm -rf "$tmpdir"
+}
+
 # ============================================================================
 # Run all tests
 # ============================================================================
@@ -685,6 +770,73 @@ test_013
 test_014
 test_015
 test_016
+
+# doctor exercises the one operation everything depends on. check/verify are
+# warn-only: a snapshot that fails is caught, logged as verdict "error", and
+# exits 0 - so a universally failing snapshot makes moire a silent no-op.
+# Containment is not detectability; this is where it becomes visible.
+test_020() {
+	local tmpdir=$(setup_test_repo)
+	TEMP_DIRS+=("$tmpdir")
+	cd "$tmpdir"
+
+	"$MOIRE_BIN" install > /dev/null 2>&1
+
+	local out_ok
+	out_ok=$("$MOIRE_BIN" doctor 2>&1)
+
+	if ! echo "$out_ok" | grep -q '^\[ok\] snapshot works'; then
+		log_test 020 FAIL "healthy repo: expected an [ok] snapshot works line"
+		rm -rf "$tmpdir"
+		return
+	fi
+
+	# New content first, so the snapshot genuinely has to WRITE. Snapshot
+	# commits are content-addressed, so re-observing an unchanged worktree
+	# resolves to OIDs that already exist and needs no write at all - which is
+	# the whole point of the fix, and would make this negative case vacuous.
+	echo "new content forcing a new blob" > forces_a_write.txt
+
+	local dirty_before
+	dirty_before=$("$MOIRE_GIT" status --porcelain 2>/dev/null)
+
+	# Now make the object store unwritable: write-tree/commit-tree must fail,
+	# and doctor must say so as [FAIL] - nothing works after this one breaks.
+	chmod -R a-w .git/objects
+
+	local out_bad rc_bad=0
+	out_bad=$("$MOIRE_BIN" doctor 2>&1) || rc_bad=$?
+
+	chmod -R u+w .git/objects
+
+	if ! echo "$out_bad" | grep -q '^\[FAIL\] snapshot works'; then
+		log_test 020 FAIL "unwritable object store: expected [FAIL] snapshot works, got: $(echo "$out_bad" | grep -i snapshot)"
+		rm -rf "$tmpdir"
+		return
+	fi
+
+	if [ "$rc_bad" -eq 0 ]; then
+		log_test 020 FAIL "a failing snapshot must make doctor exit non-zero"
+		rm -rf "$tmpdir"
+		return
+	fi
+
+	# And it must not have mutated the worktree it observed - the probe uses
+	# the same copied-index path as check/verify, so status is unchanged.
+	if [ "$("$MOIRE_GIT" status --porcelain 2>/dev/null)" != "$dirty_before" ]; then
+		log_test 020 FAIL "doctor's snapshot probe modified the worktree"
+		rm -rf "$tmpdir"
+		return
+	fi
+
+	log_test 020 PASS "doctor detects a working snapshot, and a broken one"
+
+	rm -rf "$tmpdir"
+}
+
+
+test_019
+test_020
 
 # ============================================================================
 # Summary
