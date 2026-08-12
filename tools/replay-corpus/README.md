@@ -169,7 +169,13 @@ Re-running these cached pairs is the check on whether they do. Every pair
 stopped on the same attrition rung with the same verdict, per-tree finding
 counts rose by one to two orders of magnitude — `getsentry/sentry` 4,313 →
 23,631, `PrefectHQ/prefect` 1,074 → 9,032, `Ljzd-PRO/KToolBox` 0 → 214 — and
-`new_breakage` was **0 in all 24 pairs, before and after**. The checker's own
+`new_breakage` was **0 before and after**. The population that number is over
+is **20 pairs, not 24**: of the 24, three conflicted textually and one was not
+checker-eligible, so they never reached the semantic stage and cannot be
+evidence either way. Per-tree findings across those 20 ran from 7
+(`robertmartin8/KindleClippings`) to 23,641 (`getsentry/sentry`), which is the
+point — the subtraction cancels four figures of ambient breakage without
+leaking one finding. The checker's own
 cost did not move: best of three over sentry's materialised tree (6,412 Python
 files) was 10.06 s before and 10.03 s after, because the walk and the parse
 dominate and the extra findings are set insertions. Reproduce with
