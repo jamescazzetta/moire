@@ -583,27 +583,58 @@ def link_directories_union(dest, self_worktree, peer_worktree, names):
 
 # ------------------------------------------------------ builtin semantic checker
 #
-# Cross-module import resolver over stdlib `ast`. For every `from M import N`
-# and `import M.N` where module M resolves INSIDE the materialised tree, assert
-# N is defined, imported, or re-exported by M. Third-party/stdlib imports are
-# never considered: M can only "resolve inside the tree" if some file in the
-# tree maps to that dotted name, which is structurally impossible for e.g.
-# `os` or `numpy`. This is exact, not a heuristic: an unparsable file, a `*`
-# import, or a module absent from the tree all cause us to withhold judgement
-# (return "resolves fine") rather than guess - zero false positives by
-# construction, at the cost of only catching what ast can see.
+# Cross-module import resolver over stdlib `ast`. Every import in the tree is
+# recorded as a finding unless it demonstrably resolves INSIDE that tree: for
+# `from M import N` and `import M.N`, that M is a module in the tree and N is
+# defined, imported or re-exported by it; for `import M`, that M is a module in
+# the tree at all.
+#
+# An import of a module that is not in the tree - `os`, `numpy`, and equally a
+# module some other agent just deleted - is therefore a finding too, and this
+# is deliberate. Withholding it at DETECTION time is what made the mechanism
+# blind to its own headline failure: one agent deletes or moves pkg/util.py
+# while the other adds a file importing it, the merged tree cannot import, and
+# `verify` said "semantic ok". The tool detected a NAME vanishing from a
+# surviving module and missed the MODULE vanishing - the README's own metaphor,
+# one builder moving the door while the other builds a path to where it was.
+#
+# Ambient breakage is removed by SUBTRACTION instead, which is where it always
+# belonged: `broken(merged) - broken(self) - broken(peer)`. `import os` is
+# unresolvable in all three trees, so it cancels; a module that resolved in
+# both parents and not in the merge does not. The cost is that per-tree finding
+# counts are now dominated by third-party and stdlib imports - one to two
+# orders of magnitude higher - and those counts appear in `verify`'s clean line
+# and in the record. They are an intermediate quantity; only the difference is
+# a judgement.
+#
+# What is still withheld is what `ast` genuinely cannot answer: an unparsable
+# file (conflict markers, a syntax error, an unreadable encoding), a
+# `from X import *` in the module being resolved against, whose exports cannot
+# be enumerated, and a namespace package - importable at runtime with no
+# `__init__.py` to read and members that may be extension modules `ast` never
+# sees. Each of those is a question with no answer available here, which is a
+# different thing from an answer we decline to record.
 
 _BK_SKIP_DIRS = (".git", "node_modules", ".tox", "build", "dist")
 
 
 def _module_map(root):
-    """-> {dotted module name -> file path} for every .py file under root.
+    """-> ({dotted module name -> file path}, {dotted package prefix}) for every
+    .py file under root.
 
-    Indexed under every dotted suffix (src/pkg/mod.py -> "src.pkg.mod",
-    "pkg.mod", "mod") so a `from pkg import mod` resolves regardless of
-    where in the tree "pkg" sits relative to any assumed source root.
+    Modules are indexed under every dotted suffix (src/pkg/mod.py ->
+    "src.pkg.mod", "pkg.mod", "mod") so a `from pkg import mod` resolves
+    regardless of where in the tree "pkg" sits relative to any assumed source
+    root.
+
+    The second set holds every dotted PREFIX of those names - the directories
+    on the way to a module, whether or not they carry an `__init__.py`. A
+    namespace package imports fine at runtime while owning no .py file of its
+    own, so without this set every `import a.b` under a PEP-420 layout would
+    read as an absent module.
     """
     m = {}
+    pkgs = set()
     for dp, dn, fn in os.walk(root):
         dn[:] = [d for d in dn if d not in _BK_SKIP_DIRS]
         for f in fn:
@@ -617,8 +648,11 @@ def _module_map(root):
             if not parts:
                 continue
             for i in range(len(parts)):
-                m.setdefault(".".join(parts[i:]), full)
-    return m
+                suffix = parts[i:]
+                m.setdefault(".".join(suffix), full)
+                for j in range(1, len(suffix)):
+                    pkgs.add(".".join(suffix[:j]))
+    return m, pkgs
 
 
 def _toplevel_names(path, cache):
@@ -707,8 +741,20 @@ def _broken_in_tree(root):
     files_total counts every file surviving the _BK_SKIP_DIRS pruning. Zero
     examined in a tree is the one state whose "no findings" means "no check",
     and the caller must be able to tell those apart.
+
+    A finding is (path, module, name). An empty `name` means the import names
+    no member - `import M` where M is not a module in this tree.
+
+    A RELATIVE import is recorded under its source spelling (".util", "..pkg")
+    rather than the absolute name it resolves to, and that is load-bearing for
+    the subtraction rather than cosmetic. `git mv pkg/ core/` leaves the text
+    of `from .util import helper` untouched while changing what it resolves to,
+    so a finding keyed on the resolved name would read as "pkg.util" in one
+    parent and "core.util" in the merge, cancel against nothing, and report a
+    pure directory rename as new breakage. The source spelling is invariant
+    under exactly the renames the path canonicalisation already handles.
     """
-    mm = _module_map(root)
+    mm, pkgs = _module_map(root)
     cache = {}
     out = set()
     py_examined = 0
@@ -731,26 +777,41 @@ def _broken_in_tree(root):
             for n in ast.walk(tree):
                 if isinstance(n, ast.ImportFrom):
                     mod = n.module or ""
+                    label = mod
                     if n.level:                                # relative import
                         base = pkg.split(".") if pkg else []
                         if n.level > 1:
                             base = base[:len(base) - (n.level - 1)]
                         mod = ".".join([x for x in base if x] + ([mod] if mod else []))
+                        label = "." * n.level + (n.module or "")
                     if mod not in mm:
-                        continue                               # third-party/stdlib: skip
+                        # Not a module here. `os` and `numpy` land here in every
+                        # tree and cancel in the subtraction; a module the peer
+                        # deleted or moved lands here only in the merge, which
+                        # is the whole point. A namespace package is the one
+                        # absence that is not one: it imports fine at runtime
+                        # and has no __init__.py whose exports could be read.
+                        if mod not in pkgs:
+                            for al in n.names:
+                                out.add((rel, label, al.name))
+                        continue
                     for al in n.names:
                         if al.name == "*":
-                            continue
+                            continue                           # exports unknowable
                         if not _resolves(mod, al.name, mm, cache):
-                            out.add((rel, mod, al.name))
+                            out.add((rel, label, al.name))
                 elif isinstance(n, ast.Import):
                     for al in n.names:
+                        if al.name in mm or al.name in pkgs:
+                            continue                           # the module itself is here
                         if "." not in al.name:
-                            continue                           # plain `import M`: nothing to check
-                        mod, name = al.name.rsplit(".", 1)
-                        if mod not in mm:
+                            out.add((rel, al.name, ""))
                             continue
-                        if not _resolves(mod, name, mm, cache):
+                        mod, name = al.name.rsplit(".", 1)
+                        if mod in mm:
+                            if not _resolves(mod, name, mm, cache):
+                                out.add((rel, mod, name))
+                        elif mod not in pkgs:
                             out.add((rel, mod, name))
     return out, py_examined, files_total
 
@@ -1875,8 +1936,16 @@ def cmd_verify(git, argv):
                             "git config moire.checker '<command>'   "
                             "(README: the --checker contract)\n")
                     elif mcov:
+                        # "findings", not "broken": the per-tree counts include
+                        # every import the checker could not resolve inside a
+                        # tree, which for the builtin checker means every
+                        # stdlib and third-party import in the repository. They
+                        # cancel, and saying "merged=23631 broken" next to
+                        # "semantic ok" would read as a contradiction to a
+                        # human and to an LLM. The judgement is the difference.
                         sys.stdout.write(
-                            "clean   with %s (semantic ok: self=%d peer=%d merged=%d broken; "
+                            "clean   with %s (semantic ok: no new breakage; findings "
+                            "self=%d peer=%d merged=%d; "
                             "builtin-ast examined %d of %d files - python only)\n" %
                             (peer, sem.get("self_broken", 0), sem.get("peer_broken", 0),
                              sem.get("merged_broken", 0),
@@ -1885,7 +1954,8 @@ def cmd_verify(git, argv):
                         # External checker (or a pre-coverage record): no
                         # coverage channel exists, so claim nothing about scope.
                         sys.stdout.write(
-                            "clean   with %s (semantic ok: self=%d peer=%d merged=%d broken)\n" %
+                            "clean   with %s (semantic ok: no new breakage; findings "
+                            "self=%d peer=%d merged=%d)\n" %
                             (peer, sem.get("self_broken", 0), sem.get("peer_broken", 0),
                              sem.get("merged_broken", 0)))
             _linked_union_lines(r.get("semantic"))
@@ -2126,13 +2196,18 @@ def cmd_replay(git, argv):
                     sys.stdout.write("  builtin-ast examined 0 of %d files: it reads only Python "
                                      "and this tree has no .py files.\n" % mcov.get("total", 0))
                 elif mcov:
-                    sys.stdout.write("clean   %s (semantic ok: self=%d peer=%d merged=%d broken; "
+                    # Same wording as verify, for the same reason: these are
+                    # unresolved findings per tree, most of them ambient, and
+                    # only their difference is a judgement.
+                    sys.stdout.write("clean   %s (semantic ok: no new breakage; findings "
+                                     "self=%d peer=%d merged=%d; "
                                      "builtin-ast examined %d of %d files - python only)\n" %
                                      (short, sem.get("self_broken", 0), sem.get("peer_broken", 0),
                                       sem.get("merged_broken", 0),
                                       mcov.get("examined", 0), mcov.get("total", 0)))
                 else:
-                    sys.stdout.write("clean   %s (semantic ok: self=%d peer=%d merged=%d broken)\n" %
+                    sys.stdout.write("clean   %s (semantic ok: no new breakage; findings "
+                                     "self=%d peer=%d merged=%d)\n" %
                                      (short, sem.get("self_broken", 0), sem.get("peer_broken", 0),
                                       sem.get("merged_broken", 0)))
     return 0                          # warn-only: always 0

@@ -38,6 +38,12 @@ Read that as: in the merged result, `src/service.py` refers to `validate_session
 not review, only CI after both branches land. A `BROKEN` finding is the one case
 worth interrupting yourself for.
 
+The same triple names a missing *module* as readily as a missing name: the finding
+above is a surviving `src.auth` without that function, while
+`('src/service.py', 'src.legacy', 'load')` is `src.legacy` itself deleted or moved out
+from under the import. An empty third element — `('src/cli.py', 'legacy', '')` — is a
+whole-module `import legacy` that no longer resolves.
+
 `moire` reports only breakage the *combination* creates: breakage already present in
 either branch alone is subtracted out, and findings are rewritten through a rename map
 first, so a peer's `git mv` no longer relocates your own pre-existing problems into

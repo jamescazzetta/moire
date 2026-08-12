@@ -33,6 +33,13 @@
 #     applying the pre-registered rename control (V40), naming a finding
 #     independently of argument order (V41), and refusing bad arguments
 #     before doing anything (V42)
+#   - a module the peer deleted being breakage rather than a skipped import,
+#     and the directory rename that must not become a false positive once
+#     absent modules are recorded (V43-V44)
+#
+# tests/benchmark_recall.sh measures the same checker from the other side:
+# how much of a real collision it sees, graded by running CPython over the
+# merged tree rather than by anything moire computes.
 #
 # Exit 0 only if all cases pass; else exit 1 with failure count.
 
@@ -2456,6 +2463,13 @@ test_v36_toplevel_compound_statements_bind_names() {
     # statement. Only the MERGED tree has both, so nothing cancels: a checker
     # that cannot see a name bound by `for`/`while`/`with` reports the merged
     # pair as newly broken over three names that are really there.
+    #
+    # The per-tree counts are asserted too, because they say which mechanism
+    # produced the empty result. Self is missing newmod entirely, so all three
+    # imported names are findings on its side (3); newmod's own `import io` is
+    # a module absent from the tree in both the peer and the merged tree (1
+    # each) and cancels. An ambient stdlib import that did NOT cancel would
+    # show up here as a difference between those two.
     init_repo "$repo"
     printf 'x = 1\n' > "$repo/other.py"
     git_in "$repo" add -A
@@ -2485,16 +2499,18 @@ test_v36_toplevel_compound_statements_bind_names() {
     summary=$(python3 -c "
 import json
 s = json.loads('''$json''')[0]['semantic']
-print('yes' if s['new_breakage'] == [] else 'no', s['merged_broken'], s['peer_broken'])
+print('yes' if s['new_breakage'] == [] else 'no',
+      s['self_broken'], s['merged_broken'], s['peer_broken'])
 " 2>/dev/null)
-    local nb_empty merged_broken peer_broken
-    read -r nb_empty merged_broken peer_broken <<<"$summary"
+    local nb_empty self_broken merged_broken peer_broken
+    read -r nb_empty self_broken merged_broken peer_broken <<<"$summary"
 
-    if [ "$nb_empty" = "yes" ] && [ "$merged_broken" = "0" ] && [ "$peer_broken" = "0" ]; then
+    if [ "$nb_empty" = "yes" ] && [ "$self_broken" = "3" ] && [ "$merged_broken" = "1" ] \
+       && [ "$peer_broken" = "1" ]; then
         report_result $num "$name" "PASS"
     else
         report_result $num "$name" "FAIL" \
-            "new_breakage_empty=$nb_empty merged_broken=$merged_broken peer_broken=$peer_broken"
+            "new_breakage_empty=$nb_empty self_broken=$self_broken merged_broken=$merged_broken peer_broken=$peer_broken"
     fi
 }
 
@@ -2770,6 +2786,136 @@ test_v42_replay_refuses_bad_arguments() {
     fi
 }
 
+# ---- A10: the module, not just the name. The checker used to skip any import
+# ---- whose MODULE was absent from the materialised tree, on the theory that
+# ---- only `os` and `numpy` land there. A module the peer deleted or moved
+# ---- lands there too, so the headline failure - one agent moves the door
+# ---- while the other builds a path to where it was - reported "semantic ok".
+# ---- V43 is that case; V44 is the false positive the fix must not buy.
+
+test_v43_deleted_module_is_breakage() {
+    local num=43 name="a-module-the-peer-deleted-is-new-breakage"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+
+    # Peer deletes pkg/util.py and stops importing it - complete, tidy work on
+    # its own branch. Self adds a new file that imports it. Disjoint file sets,
+    # clean textual merge, and a merged tree that cannot be imported:
+    # `python3 -c "import pkg.newfeature"` on it raises ModuleNotFoundError.
+    init_repo "$repo"
+    mkdir -p "$repo/pkg"
+    : > "$repo/pkg/__init__.py"
+    printf 'def helper():\n    return 1\n' > "$repo/pkg/util.py"
+    printf 'from pkg.util import helper\nhelper()\n' > "$repo/pkg/main.py"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm base >/dev/null 2>&1
+    local base; base=$(git_in "$repo" rev-parse HEAD)
+
+    git_in "$repo" checkout -q -b branch_a >/dev/null 2>&1
+    printf 'from pkg.util import helper\nhelper()\n' > "$repo/pkg/newfeature.py"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm "self: new feature importing helper" >/dev/null 2>&1
+
+    git_in "$repo" checkout -q "$base" >/dev/null 2>&1
+    git_in "$repo" checkout -q -b branch_b >/dev/null 2>&1
+    git_in "$repo" rm -q pkg/util.py >/dev/null 2>&1
+    printf 'x = 1\n' > "$repo/pkg/main.py"
+    git_in "$repo" commit -qam "peer: delete util and its last caller" >/dev/null 2>&1
+    git_in "$repo" checkout -q branch_a >/dev/null 2>&1
+
+    if ! git_in "$repo" worktree add -q "$test_dir/peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    local json human
+    json=$(run_verify_uncached "$repo")
+    human=$(cd "$repo" && MOIRE_CACHE_TTL=0 MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" verify 2>/dev/null)
+
+    local summary
+    summary=$(python3 -c "
+import json
+s = json.loads('''$json''')[0]['semantic']
+print('yes' if s['new_breakage'] == [['pkg/newfeature.py', 'pkg.util', 'helper']] else 'no',
+      s['self_broken'], s['peer_broken'])
+" 2>/dev/null)
+    local nb_right self_broken peer_broken
+    read -r nb_right self_broken peer_broken <<<"$summary"
+
+    local broken_line=no says_ok=no
+    echo "$human" | grep -q '^BROKEN' && broken_line=yes
+    echo "$human" | grep -q 'semantic ok' && says_ok=yes
+
+    if [ "$nb_right" = "yes" ] && [ "$self_broken" = "0" ] && [ "$peer_broken" = "0" ] \
+       && [ "$broken_line" = "yes" ] && [ "$says_ok" = "no" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "new_breakage_is_the_deleted_module=$nb_right self=$self_broken peer=$peer_broken printed_BROKEN=$broken_line said_semantic_ok=$says_ok"
+    fi
+}
+
+test_v44_directory_rename_over_unresolvable_relative_import() {
+    local num=44 name="directory-rename-over-an-unresolvable-relative-import-stays-clean"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+
+    # `from ._native import ffi` where _native is a compiled extension is
+    # ordinary, and unresolvable to anything reading .py files - so it is a
+    # finding in every tree, and has to cancel. The peer renames the package
+    # directory, which leaves that import's TEXT untouched while changing what
+    # it resolves to (pkg._native -> core._native). A finding keyed on the
+    # resolved name would stop cancelling and report a pure `git mv` as new
+    # breakage; keying it on the source spelling is what makes the path
+    # canonicalisation sufficient.
+    init_repo "$repo"
+    mkdir -p "$repo/pkg"
+    : > "$repo/pkg/__init__.py"
+    printf 'from ._native import ffi\nfrom .util import helper\nffi(helper())\n' > "$repo/pkg/api.py"
+    printf 'def helper():\n    return 1\n' > "$repo/pkg/util.py"
+    printf 'z = 1\n' > "$repo/other.py"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm base >/dev/null 2>&1
+    local base; base=$(git_in "$repo" rev-parse HEAD)
+
+    git_in "$repo" checkout -q -b branch_a >/dev/null 2>&1
+    printf 'z = 2\n' > "$repo/other.py"
+    git_in "$repo" commit -qam "self: unrelated edit" >/dev/null 2>&1
+
+    git_in "$repo" checkout -q "$base" >/dev/null 2>&1
+    git_in "$repo" checkout -q -b branch_b >/dev/null 2>&1
+    git_in "$repo" mv pkg core >/dev/null 2>&1
+    git_in "$repo" commit -qam "peer: rename the package directory" >/dev/null 2>&1
+    git_in "$repo" checkout -q branch_a >/dev/null 2>&1
+
+    if ! git_in "$repo" worktree add -q "$test_dir/peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    local json
+    json=$(run_verify_uncached "$repo")
+    local summary
+    summary=$(python3 -c "
+import json
+s = json.loads('''$json''')[0]['semantic']
+print('yes' if s['new_breakage'] == [] else 'no', s['self_broken'], s['merged_broken'])
+" 2>/dev/null)
+    local nb_empty self_broken merged_broken
+    read -r nb_empty self_broken merged_broken <<<"$summary"
+
+    if [ "$nb_empty" = "yes" ] && [ "$self_broken" = "1" ] && [ "$merged_broken" = "1" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "new_breakage_empty=$nb_empty self_broken=$self_broken merged_broken=$merged_broken"
+    fi
+}
+
 # === MAIN ===
 
 main() {
@@ -2833,6 +2979,8 @@ main() {
     test_v40_replay_canonicalises_renames
     test_v41_replay_finding_id_symmetric
     test_v42_replay_refuses_bad_arguments
+    test_v43_deleted_module_is_breakage
+    test_v44_directory_rename_over_unresolvable_relative_import
 
     # Print summary
     local total=$((PASSED + FAILED + SKIPPED))
