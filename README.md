@@ -312,7 +312,7 @@ For each peer worktree:
 
 The default checker is a small Python import resolver with no dependencies: it proves an import still resolves — both the module and the name it takes from it — not that its contract held. A function whose exported name is unchanged while its return type widens from `string` to `string | null` is invisible to it, and so is an argument added to a signature. For a statically-typed language, point `--checker` at a real type checker.
 
-It records an import of a module that is not in the tree as a finding, `os` and `numpy` included, and lets the subtraction throw those away: they are unresolvable in all three trees and cancel, while a module one agent deleted or `git mv`d is unresolvable only in the merge. Withholding those at detection time instead — which is what it used to do — made it blind to the case this tool exists for, one agent moving the door while the other builds a path to where it was. The consequence is that the per-tree counts on the clean line are large and mostly stdlib; they are an intermediate quantity, and only the difference between them is a judgement. `tests/benchmark_recall.sh` measures what that buys: **7 of 8** textually clean collisions whose breakage CPython confirms on the merged tree, against **2 of 8** before, with **0 of 6** clean merges reported as broken. The one it still misses is the changed signature.
+It records an import of a module that is not in the tree as a finding, `os` and `numpy` included, and lets the subtraction throw those away: they are unresolvable in all three trees and cancel, while a module one agent deleted or `git mv`d is unresolvable only in the merge. Withholding those at detection time instead — which is what it used to do — made it blind to the case this tool exists for, one agent moving the door while the other builds a path to where it was. The consequence is that the per-tree counts on the clean line are large and mostly stdlib; they are an intermediate quantity, and only the difference between them is a judgement. `tests/benchmark_recall.sh` measures what that buys: **7 of 8** textually clean collisions whose breakage CPython confirms on the merged tree, against **2 of 8** before, with **0 of 7** clean merges reported as broken. The one it still misses is the changed signature.
 
 It **reads Python only**, and it says so rather than implying otherwise. When the merged tree contains no `.py` files there is nothing it can examine, so `verify` reports that instead of claiming the merge is fine:
 
@@ -605,7 +605,7 @@ bash tests/test_report.sh    #  7 cases: finding identity, pair-state metrics, r
 bash tests/test_setup.sh     # 14 cases: init-swarm, wire-client, settings-file handling
 bash tests/test_verify.sh    # 44 cases: the semantic path — new_breakage, renames, --link union, replay
 bash tests/negative_control.sh   # proves the five suites above can fail
-bash tests/benchmark_recall.sh   # 14 collision fixtures graded by CPython, not by moire
+bash tests/benchmark_recall.sh   # 15 collision fixtures graded by CPython, not by moire
 ```
 
 **98 cases; measured 2026-08-12: 97 passed, 1 skipped, 0 failed.** The skip is a
@@ -635,13 +635,14 @@ weaker, and is stated here rather than glossed.
 
 `tests/benchmark_recall.sh` is the answer to that weakness, and it asks a different
 question from the suites: not whether the mechanism behaves as specified, but how much
-of a real collision it sees. Fourteen textually clean fixtures — a deleted module, a
+of a real collision it sees. Fifteen textually clean fixtures — a deleted module, a
 `git mv`, a package rename, a removed name, a changed signature, a name one side
-supplies for the other, and the third-party imports that must never fire — are graded
+supplies for the other, a namespace package, and the third-party imports that must
+never fire — are graded
 by materialising the same three trees and **importing every module in each with
 CPython**, then subtracting the interpreter's errors exactly as moire subtracts its
 own. Nothing in it consults moire's verdict. Measured 2026-08-12: **7 of 8** confirmed
-collisions caught and **0 of 6** clean merges reported, against **2 of 8** and 0 of 6
+collisions caught and **0 of 7** clean merges reported, against **2 of 8** and 0 of 7
 for the previous checker (`git show febc36b:bin/moire`). The miss is the changed
 signature, which is not a name that stopped resolving and is out of reach of an import
 resolver by construction.
@@ -675,7 +676,7 @@ and which one is always stated:
 macOS 15.7.3, Python 3.8.2, git 2.55.0): the [cost table](#cost) and its 21 ms
 process floor; the 62-of-63-files checker coverage; the zero loose objects over 20
 idle checks; the 98 test cases and their 97/1/0 outcome; the negative control's 10 of
-10; the recall benchmark's 7-of-8 and 2-of-8 scores with 0 of 6 false positives; the
+10; the recall benchmark's 7-of-8 and 2-of-8 scores with 0 of 7 false positives; the
 object-store observations in [what
 observation writes](#what-observation-writes-and-where); both Clash reproductions. The
 cost table was taken under load averages of 10.19–11.44 on 8 cores and is published as

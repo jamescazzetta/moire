@@ -472,6 +472,33 @@ case_deleted_with_importers() {
     git_in "$repo" checkout -q self >/dev/null 2>&1
 }
 
+# N7: peer deletes an `__init__.py`, turning a regular package into a PEP-420
+# namespace package, while self adds a file importing across it. Nothing broke
+# - Python 3 imports a namespace package perfectly well - and this is the only
+# case that holds the checker's package-prefix set to account. That set exists
+# because a namespace package owns no .py file of its own, so without it every
+# `import pkg.sub` under this layout reads as an absent module and one deleted
+# `__init__.py` flips a whole tree into new breakage. The blast radius is why
+# it is worth a case rather than an argument.
+case_namespace_package() {
+    local repo="$1"
+    mkdir -p "$repo/pkg/sub"
+    : > "$repo/pkg/__init__.py"
+    printf 'def helper():\n    return 1\n' > "$repo/pkg/util.py"
+    printf 'def deep():\n    return 2\n' > "$repo/pkg/sub/thing.py"
+    printf 'from pkg.util import helper\nimport pkg.sub.thing\n\nVALUE = helper()\n' > "$repo/pkg/main.py"
+    commit_all "$repo" base
+    git_in "$repo" branch peer >/dev/null 2>&1
+    git_in "$repo" checkout -q -b self >/dev/null 2>&1
+    printf 'from pkg.util import helper\nimport pkg.sub.thing\nfrom pkg.sub.thing import deep\n\nRESULT = helper() + deep()\n' \
+        > "$repo/pkg/newfeature.py"
+    commit_all "$repo" "self: new feature importing across the package"
+    git_in "$repo" checkout -q peer >/dev/null 2>&1
+    git_in "$repo" rm -q "pkg/__init__.py" >/dev/null 2>&1
+    commit_all "$repo" "peer: make pkg a namespace package"
+    git_in "$repo" checkout -q self >/dev/null 2>&1
+}
+
 # ------------------------------------------------------------------ scoring
 
 # run_case <role: positive|negative> <name> <builder>
@@ -602,6 +629,7 @@ main() {
     run_case negative self-preexisting-breakage case_self_preexisting_breakage
     run_case negative peer-supplies-name        case_peer_supplies_name
     run_case negative deleted-with-importers    case_deleted_with_importers
+    run_case negative namespace-package         case_namespace_package
 
     local positives=$((CAUGHT + MISSED))
     local negatives=$((TRUE_NEG + FALSE_POS))

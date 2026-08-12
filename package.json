@@ -38,7 +38,7 @@
     "node": ">=14"
   },
   "scripts": {
-    "test": "bash tests/test_oracle.sh && bash tests/test_install.sh && bash tests/test_report.sh && bash tests/test_setup.sh && bash tests/test_verify.sh"
+    "test": "bash tests/test_oracle.sh && bash tests/test_install.sh && bash tests/test_report.sh && bash tests/test_setup.sh && bash tests/test_verify.sh && bash tests/benchmark_recall.sh"
   },
   "publishConfig": {
     "access": "public"
