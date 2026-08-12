@@ -161,6 +161,21 @@ as agreement or disagreement — the gate is meaningful only at full scale.
 rate therefore has little support in this population; a run that wants to
 calibrate against it should use `all_pull_request`.
 
+**The same 24 pairs, replayed again after the checker was widened.** The builtin
+checker now records an import whose MODULE is absent from the tree instead of
+skipping it, so that a module another agent deleted or moved is visible at all;
+`os` and `numpy` are recorded too and are meant to cancel in the subtraction.
+Re-running these cached pairs is the check on whether they do. Every pair
+stopped on the same attrition rung with the same verdict, per-tree finding
+counts rose by one to two orders of magnitude — `getsentry/sentry` 4,313 →
+23,631, `PrefectHQ/prefect` 1,074 → 9,032, `Ljzd-PRO/KToolBox` 0 → 214 — and
+`new_breakage` was **0 in all 24 pairs, before and after**. The checker's own
+cost did not move: best of three over sentry's materialised tree (6,412 Python
+files) was 10.06 s before and 10.03 s after, because the walk and the parse
+dominate and the extra findings are set insertions. Reproduce with
+`run --pairs pilot2-pairs.jsonl --out <somewhere-else>.jsonl`; the pairs and the
+pre-change results are both in `cache/`.
+
 **Run it with disk and memory headroom.** Three trees of a large repository are
 materialised at once, and anything that truncates them mid-run makes the
 checker under-count silently. `moire replay` now refuses to call a merged tree

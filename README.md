@@ -310,7 +310,9 @@ For each peer worktree:
    borrowed whole from your side. The residual limits are in the `--checker`
    contract below; they are real and they are stated.
 
-The default checker is a small Python import resolver with no dependencies: it proves an imported name still resolves, not that its contract held — a function whose exported name is unchanged while its return type widens from `string` to `string | null` is invisible to it. For a statically-typed language, point `--checker` at a real type checker.
+The default checker is a small Python import resolver with no dependencies: it proves an import still resolves — both the module and the name it takes from it — not that its contract held. A function whose exported name is unchanged while its return type widens from `string` to `string | null` is invisible to it, and so is an argument added to a signature. For a statically-typed language, point `--checker` at a real type checker.
+
+It records an import of a module that is not in the tree as a finding, `os` and `numpy` included, and lets the subtraction throw those away: they are unresolvable in all three trees and cancel, while a module one agent deleted or `git mv`d is unresolvable only in the merge. Withholding those at detection time instead — which is what it used to do — made it blind to the case this tool exists for, one agent moving the door while the other builds a path to where it was. The consequence is that the per-tree counts on the clean line are large and mostly stdlib; they are an intermediate quantity, and only the difference between them is a judgement. `tests/benchmark_recall.sh` measures what that buys: **7 of 8** textually clean collisions whose breakage CPython confirms on the merged tree, against **2 of 8** before, with **0 of 6** clean merges reported as broken. The one it still misses is the changed signature.
 
 It **reads Python only**, and it says so rather than implying otherwise. When the merged tree contains no `.py` files there is nothing it can examine, so `verify` reports that instead of claiming the merge is fine:
 
@@ -322,7 +324,7 @@ clean   with /repo-agent-b (textual only - no semantic check was performed)
   To enable semantic verification for this repo: git config moire.checker '<command>'   (README: the --checker contract)
 ```
 
-Such a record is excluded from `moire report`'s semantic rate and counted under `unperformed_semantic_checks` instead — a check that measured nothing must not be averaged in as a clean one. On the happy path the same honesty appears as scope: `(semantic ok: self=0 peer=0 merged=0 broken; builtin-ast examined 12 of 40 files - python only)`.
+Such a record is excluded from `moire report`'s semantic rate and counted under `unperformed_semantic_checks` instead — a check that measured nothing must not be averaged in as a clean one. On the happy path the same honesty appears as scope: `(semantic ok: no new breakage; findings self=37 peer=39 merged=39; builtin-ast examined 12 of 40 files - python only)`. Those per-tree counts are *findings*, not breakage the merge caused — most of them are the repository's ordinary stdlib and third-party imports, which the builtin checker cannot resolve inside a materialised tree and which cancel in the subtraction. Only their difference is a judgement.
 
 ### Pointing `verify` at your language, per repo
 
@@ -557,6 +559,16 @@ So this is a working instrument aimed at an open quantity, not a proven product.
 
 ## What changed in 0.12
 
+- **The builtin checker sees a module vanish, not only a name.** It used to skip any
+  import whose module was absent from the materialised tree, which is right for `os`
+  and `numpy` and catastrophic for a module the other agent just deleted or moved: the
+  headline failure this tool is about reported `semantic ok`. Absent modules are now
+  findings, and the existing `broken(merged) − broken(self) − broken(peer)` subtraction
+  removes the ambient ones — recall on the new
+  [recall benchmark](#tests) goes from 2 of 8 to 7 of 8 with no new false positive
+  there or on the pilot corpus pairs. Per-tree finding counts rise by one to two orders
+  of magnitude as a result; the difference between them, which is the judgement, does
+  not.
 - **`moire report` rates situations, not observations.** Its denominators are now
   distinct *pair-states* — distinct observed `(self_tree, peer_tree)` content pairs —
   and distinct findings, with raw observation counts kept alongside for transparency.
@@ -591,11 +603,12 @@ bash tests/test_oracle.sh    # 12 cases: conflict detection vs real `git merge`
 bash tests/test_install.sh   # 21 cases: install, hooks, path resolution, concurrency, object-store growth
 bash tests/test_report.sh    #  7 cases: finding identity, pair-state metrics, replay statelessness
 bash tests/test_setup.sh     # 14 cases: init-swarm, wire-client, settings-file handling
-bash tests/test_verify.sh    # 42 cases: the semantic path — new_breakage, renames, --link union, replay
+bash tests/test_verify.sh    # 44 cases: the semantic path — new_breakage, renames, --link union, replay
 bash tests/negative_control.sh   # proves the five suites above can fail
+bash tests/benchmark_recall.sh   # 14 collision fixtures graded by CPython, not by moire
 ```
 
-**96 cases; measured 2026-08-12: 95 passed, 1 skipped, 0 failed.** The skip is a
+**98 cases; measured 2026-08-12: 97 passed, 1 skipped, 0 failed.** The skip is a
 `DeprecationWarning` check that only applies on Python 3.12+ and this machine runs
 3.8.2.
 
@@ -620,6 +633,19 @@ path, so that silence counts as correct only if the tool saw the breakage and at
 it to the right side. The other semantic cases assert against moire's own JSON, which is
 weaker, and is stated here rather than glossed.
 
+`tests/benchmark_recall.sh` is the answer to that weakness, and it asks a different
+question from the suites: not whether the mechanism behaves as specified, but how much
+of a real collision it sees. Fourteen textually clean fixtures — a deleted module, a
+`git mv`, a package rename, a removed name, a changed signature, a name one side
+supplies for the other, and the third-party imports that must never fire — are graded
+by materialising the same three trees and **importing every module in each with
+CPython**, then subtracting the interpreter's errors exactly as moire subtracts its
+own. Nothing in it consults moire's verdict. Measured 2026-08-12: **7 of 8** confirmed
+collisions caught and **0 of 6** clean merges reported, against **2 of 8** and 0 of 6
+for the previous checker (`git show febc36b:bin/moire`). The miss is the changed
+signature, which is not a name that stopped resolving and is out of reach of an import
+resolver by construction.
+
 ## Repository layout
 
 ```
@@ -627,7 +653,8 @@ bin/moire            the tool — a single file, Python 3.8, standard library on
 bin/moire.js         Node launcher, retained for a distribution that does not exist yet
 skills/              two Agent Skills: one for acting on a finding, one for
                      setting up parallel work
-tests/               96 cases across five suites, plus the negative control
+tests/               98 cases across five suites, plus the negative control and
+                     the recall benchmark
 tools/replay-corpus/ the Phase 1 measurement harness (stdlib only, not shipped)
 PHASE1-PREREGISTRATION.md   the decision rule, committed before any data
 package.json         npm packaging metadata; nothing is published
@@ -647,8 +674,9 @@ and which one is always stated:
 **1. Measured here, 2026-08-12, on an Apple M1 MacBook Pro** (`MacBookPro17,1`,
 macOS 15.7.3, Python 3.8.2, git 2.55.0): the [cost table](#cost) and its 21 ms
 process floor; the 62-of-63-files checker coverage; the zero loose objects over 20
-idle checks; the 96 test cases and their 95/1/0 outcome; the negative control's 10 of
-10; the object-store observations in [what
+idle checks; the 98 test cases and their 97/1/0 outcome; the negative control's 10 of
+10; the recall benchmark's 7-of-8 and 2-of-8 scores with 0 of 6 false positives; the
+object-store observations in [what
 observation writes](#what-observation-writes-and-where); both Clash reproductions. The
 cost table was taken under load averages of 10.19–11.44 on 8 cores and is published as
 a **ceiling**, not a figure.
