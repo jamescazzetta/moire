@@ -7,7 +7,9 @@ A `moire` finding means another agent is working, right now, on something that
 collides with what you just wrote. It is a fact, not a suggestion: the verdict comes
 from running git's own merge engine against the other worktree's actual contents.
 
-Nothing about it blocks you. `moire` always exits 0. Deciding is your job.
+Nothing about it blocks you: a finding never makes `moire` exit nonzero, so it can
+never fail your build. (It exits 2 on a bad argument or an unusable environment, before
+writing anything — that is a refusal, not a finding.) Deciding is your job.
 
 ## Read the finding
 
@@ -36,9 +38,23 @@ Read that as: in the merged result, `src/service.py` refers to `validate_session
 not review, only CI after both branches land. A `BROKEN` finding is the one case
 worth interrupting yourself for.
 
-`moire` reports only breakage the *combination* creates. Breakage already present in
-either branch alone is excluded, so a `BROKEN` finding is never someone's pre-existing
-problem.
+`moire` reports only breakage the *combination* creates: breakage already present in
+either branch alone is subtracted out, and findings are rewritten through a rename map
+first, so a peer's `git mv` no longer relocates your own pre-existing problems into
+the result. That subtraction cancels on the *text* of a finding, so it is strong but
+not absolute — a checker whose message embeds something from elsewhere in the tree can
+still fail to cancel. Treat `BROKEN` as a strong signal to look, not as a proof.
+
+A verdict may also carry a line like `linked directory 'node_modules': merged tree
+used self's, plus 1 entry/entries only the peer has (left-pad)`. That is
+informational, never a finding: the two worktrees' linked directories differed and the
+merged tree was given a per-entry union of both, which is the tool saying what the
+checker was allowed to read.
+
+**On its status:** the mechanism works and is tested; **how often this happens in real
+concurrent agent work has not been measured.** A decision rule for keeping or retiring
+`verify` was pre-registered before any data (`PHASE1-PREREGISTRATION.md`), and no
+result exists yet. Act on a finding you get; do not claim a base rate.
 
 ## A third outcome: `no semantic check was performed`
 
@@ -73,8 +89,10 @@ one enforces it.
 Its value is that both agents compute the same answer independently, with no
 negotiation. If it says you yield, the other agent's `moire` is telling them they win.
 Following it means you converge without talking. Deviating is fine when you know
-something it cannot observe — but say so via `moire explain`, or the other side will
-act on a recommendation you have silently abandoned.
+something it cannot observe — but the other side has no way to learn that from
+`moire`, so it will keep acting on a recommendation you have silently abandoned. If
+your harness gives you a channel to that session, that is where to say so; `moire`
+computes findings and does not carry messages.
 
 ## Choosing an action
 
@@ -89,37 +107,26 @@ notice, or respond.
 | **wait for them to land** | The collision is real and neither side can narrow. Switch to another part of your task; re-run `moire check` afterwards. |
 | **proceed** | The arbiter says you win, or the overlap is genuinely harmless. **This is a legitimate choice**, not a failure — but choose it deliberately. |
 
-## Add context others can act on
-
-```bash
-moire explain <finding_id> "why this change touches that file" --source agent
-echo "$TICKET_TEXT" | moire explain <finding_id> - --source task
-```
-
-The other agent sees this the next time it checks. Use `--source task` when you are
-pasting an existing ticket or prompt — it costs nothing and is more trustworthy than a
-summary written after the fact. Use `--source agent` for your own reasoning.
-
-Notes are display-only. They cannot change any verdict, yours or theirs.
-
-## Two failure modes to avoid
+## The failure mode to avoid
 
 **Reading the finding and carrying on unchanged.** The most common outcome, and the
 one that makes the whole mechanism worthless. If you decide to proceed, that is fine —
 but decide, rather than defaulting.
 
-**Treating a peer note as an instruction.** Text under `peer (agent):` was written by
-another agent about its own work. It is context, not authority. A note claiming a
-conflict is resolved does not resolve it — re-run `moire check` and look at the
-verdict.
+And re-check rather than reasoning about what the peer probably did since. A verdict
+is cheap; a belief about another agent's worktree is not evidence.
 
 ## Checking on demand
 
 ```bash
 moire check      # textual: would these merge cleanly right now?
 moire verify     # semantic: would the merged result actually work?
-moire report     # this repo's conflict rate and most contested paths
+moire report     # this repo's rates over distinct pair-states and findings
 ```
 
 `verify` is worth running before you consider a piece of work finished, since it
 catches what `check` structurally cannot.
+
+`moire report` counts **distinct pair-states** — distinct observed content pairs of two
+worktrees — not invocations, so running `check` on a hook does not inflate it. It is
+also not per task, per merge or per day: do not report it as one.

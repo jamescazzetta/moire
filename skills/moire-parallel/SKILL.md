@@ -37,6 +37,12 @@ do not symlink a shared `node_modules`, `.venv`, or `vendor` across worktrees to
 skip the step. Concurrent agents would then be mutating each other's dependencies,
 which is exactly the class of interference moire exists to detect.
 
+Observing a peer writes that peer's **untracked, non-gitignored** files into the
+repository's shared object store, where they persist refless until git's housekeeping
+prunes them. Gitignored files are never captured, so make sure `.env*`, credentials
+and key material are gitignored before dispatching a swarm. The README section "What
+observation writes, and where" has the detail.
+
 **If the repository is not Python, configure the checker once, before dispatching
 anyone.** `moire verify`'s default checker reads Python only; on any other repository
 it examines nothing and reports `no semantic check was performed` — every agent then
@@ -71,9 +77,11 @@ Give each agent:
 - **Its worktree path**, and an instruction to stay inside it. An agent that wanders
   into a sibling worktree defeats the whole arrangement.
 - **One task**, scoped so it can be finished and verified alone.
-- **No instruction to coordinate with the others.** They do not need to talk. Agents
-  negotiating with each other has been measured to consume budget without improving
-  outcomes; `moire` reports collisions as facts instead.
+- **No instruction to coordinate with the others.** They do not need to talk. Every
+  scheme that asks agents to announce or claim their work fails open the moment one
+  agent does not participate, and there is no way to make participation mandatory
+  across vendors; `moire` reports collisions as facts instead of asking anyone to
+  declare them.
 
 ## What each agent must do
 
@@ -85,12 +93,22 @@ Two rules, and the second is the one that gets skipped:
 2. **Run `moire verify` before declaring the task done.** The per-write hook catches
    collisions as they happen, but a semantic break often only becomes one once *both*
    sides have finished writing. `verify` is what catches a merge that is textually
-   clean and functionally broken.
+   clean and functionally broken. Its findings are rename-safe: a peer moving a file
+   no longer relocates an agent's own pre-existing breakage into the result, and a
+   dependency directory that differs between two worktrees is unioned rather than
+   borrowed from one side.
+
+   How *often* this fires in real concurrent agent work is unmeasured — see
+   `PHASE1-PREREGISTRATION.md`, which fixes the keep-or-retire rule before the data.
+   Run it because a finding is cheap to act on and expensive to miss, not because a
+   published rate says you should.
 
 ## Collecting the result
 
 Each agent's work is a branch. Merge them in whatever order suits; `moire report`
-afterwards shows how often they collided and which paths were contested.
+afterwards shows how often they collided and which paths were contested. Its rates are
+over distinct **pair-states** — distinct observed content pairs of two worktrees — not
+over invocations, so a per-write hook does not inflate them.
 
 If two branches conflicted and neither yielded, the arbiter line in the finding named
 which one should have — that is the one to rebase onto the other.
