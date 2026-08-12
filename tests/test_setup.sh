@@ -34,8 +34,30 @@ SKIP_COUNT=0
 # Track temp directories for cleanup
 declare -a TEMP_DIRS
 
+# Suite-wide HOME isolation.
+#
+# `init-swarm` installs skills, and `--skills user` is its default, so any case
+# that runs it without an override writes into the invoker's real ~/.claude and
+# ~/.agents -- overwriting live skills and leaving *.moire-backup directories
+# that then register as duplicate skills. Cases 002/003/004 did exactly that.
+#
+# Isolating per-case is what failed: it only protects the cases someone
+# remembered to protect. This isolates the whole suite, so a new case cannot
+# reintroduce the leak by omission. Cases that manage HOME themselves (005,
+# 006) still work -- they save and restore around this one, which is already
+# a fixture.
+REAL_HOME="$HOME"
+SUITE_HOME="$(mktemp -d)"
+export HOME="$SUITE_HOME"
+
 # Cleanup function
 cleanup_on_exit() {
+	# Restore first, so anything below that consults $HOME sees the real one.
+	export HOME="$REAL_HOME"
+	case "$SUITE_HOME" in
+		/tmp/*|/private/tmp/*|/var/folders/*|"${TMPDIR%/}"/*) rm -rf "$SUITE_HOME" ;;
+		*) : ;;
+	esac
 	if [[ ${#TEMP_DIRS[@]} -gt 0 ]]; then
 		for tmpdir in "${TEMP_DIRS[@]}"; do
 			# Fixtures are <mktemp-root>/repo; removing only the repo would leave the
