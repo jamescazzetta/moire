@@ -494,6 +494,95 @@ def link_directories(dest, source_worktree, names):
     return linked
 
 
+def link_directories_union(dest, self_worktree, peer_worktree, names):
+    """Link a named directory into the MERGED tree from BOTH worktrees at once.
+
+    The merged state was never checked out anywhere, so it has no dependency
+    directory of its own and has to borrow one. Borrowing self's whole
+    directory - what link_directories does - is wrong in one ordinary case:
+    the peer added something to its own copy (installed a dependency) and its
+    committed code refers to it. The merged tree then contains the peer's
+    code and self's directory, the checker cannot resolve the entry, and the
+    difference is reported as breakage the pair created. It is not: it is an
+    artifact of which worktree the borrowed directory came from. That was
+    reproduced, and this is the fix.
+
+    Per name: if only one worktree has the directory, symlink that one whole.
+    If both have it and every top-level entry of the peer's is also in self's,
+    symlink self's whole - the union would be byte-identical and a directory
+    of symlinks is strictly more to go wrong. Only when the peer has entries
+    self does not (the divergence that actually matters) is a real union
+    built: a directory of per-entry symlinks, self's copy winning every
+    both-present entry, because self's tree is the one the merged tree
+    otherwise resembles.
+
+    -> {name: {"mode": "self"|"peer"|"union", "from_peer": [entry, ...],
+    "peer_only_count": n}}. Provenance, not a claim: moire knows nothing
+    about what any of these entries are, and never says "package".
+
+    Any error building a union degrades to the whole-self symlink and records
+    "union_error" - the same posture as everything else here, where a link
+    that cannot be made is a checker that sees less, never a failed verdict.
+
+    The union directory itself lives in the throwaway merged tree and is
+    removed with it; `shutil.rmtree` unlinks symlinks rather than following
+    them, so neither worktree's real directory is touched. The links are LIVE
+    in the same sense link_directories describes - a checker that writes into
+    one writes through into a real worktree - and this adds no exposure the
+    peer did not already have, since the peer tree links from the peer's own
+    worktree already. Only link a directory whose contamination by the
+    checker is acceptable.
+    """
+    provenance = {}
+    for name in names:
+        if not _valid_link_name(name):
+            continue
+        tgt = os.path.join(dest, name)
+        if os.path.lexists(tgt):
+            continue                  # tracked entry materialised there: leave it alone
+        s = os.path.join(self_worktree, name)
+        p = os.path.join(peer_worktree, name)
+        s_dir, p_dir = os.path.isdir(s), os.path.isdir(p)
+        if not s_dir and not p_dir:
+            continue
+        if not p_dir:
+            os.symlink(os.path.abspath(s), tgt)
+            provenance[name] = {"mode": "self", "from_peer": [], "peer_only_count": 0}
+            continue
+        if not s_dir:
+            os.symlink(os.path.abspath(p), tgt)
+            provenance[name] = {"mode": "peer", "from_peer": [], "peer_only_count": 0}
+            continue
+        try:
+            s_entries = sorted(os.listdir(s))
+            peer_only = sorted(set(os.listdir(p)) - set(s_entries))
+        except OSError as ex:
+            os.symlink(os.path.abspath(s), tgt)
+            provenance[name] = {"mode": "self", "from_peer": [], "peer_only_count": 0,
+                                "union_error": str(ex)}
+            continue
+        if not peer_only:
+            os.symlink(os.path.abspath(s), tgt)
+            provenance[name] = {"mode": "self", "from_peer": [], "peer_only_count": 0}
+            continue
+        try:
+            os.mkdir(tgt)
+            for e in s_entries:
+                os.symlink(os.path.join(os.path.abspath(s), e), os.path.join(tgt, e))
+            for e in peer_only:
+                os.symlink(os.path.join(os.path.abspath(p), e), os.path.join(tgt, e))
+        except OSError as ex:
+            shutil.rmtree(tgt, ignore_errors=True)
+            provenance[name] = {"mode": "self", "from_peer": [], "peer_only_count": 0,
+                                "union_error": str(ex)}
+            if not os.path.lexists(tgt):
+                os.symlink(os.path.abspath(s), tgt)
+            continue
+        provenance[name] = {"mode": "union", "from_peer": peer_only[:20],
+                            "peer_only_count": len(peer_only)}
+    return provenance
+
+
 # ------------------------------------------------------ builtin semantic checker
 #
 # Cross-module import resolver over stdlib `ast`. For every `from M import N`
@@ -539,10 +628,20 @@ def _toplevel_names(path, cache):
 
     `names` covers defs, classes, plain/annotated assignments, and anything
     brought into scope by import/import-from - i.e. defined, imported, or
-    re-exported. A top-level `if`/`try` is additionally flattened with a full
-    `ast.walk` (conditional defs, try/except import fallbacks are idiomatic
-    Python) so nothing nested inside one is missed - under-counting names
-    here is exactly the failure mode that would manufacture a false positive.
+    re-exported. Every top-level COMPOUND statement is additionally flattened
+    with a full `ast.walk`: `if`/`try` (conditional defs and try/except import
+    fallbacks) but equally `for`/`while`/`with`, which bind top-level names
+    just as effectively -
+
+        with open(p) as f:
+            CONFIG = json.load(f)
+
+        for name in ("a", "b"):
+            globals()[name] = make(name)
+
+    - and were missed, so an importer of such a name was reported as broken.
+    Under-counting names here is exactly the failure mode that manufactures a
+    false positive, which is the one thing this checker claims not to do.
     """
     if path in cache:
         return cache[path]
@@ -574,9 +673,11 @@ def _toplevel_names(path, cache):
                 else:
                     names.add(al.asname or al.name)
 
+    compound = (ast.If, ast.Try, ast.For, ast.AsyncFor, ast.While,
+                ast.With, ast.AsyncWith)
     for n in top.body:
         note(n)
-        if isinstance(n, (ast.If, ast.Try)):
+        if isinstance(n, compound):
             for sub in ast.walk(n):
                 note(sub)
     cache[path] = (names, star[0])
@@ -707,6 +808,99 @@ def run_checker(checker, directory, timeout):
     if p.returncode != 0 and not lines:
         lines.add(NONZERO_NO_OUTPUT)
     return frozenset(lines), None
+
+
+# ------------------------------------------------------- rename canonicalisation
+#
+# The subtraction `broken(merged) - broken(self) - broken(peer)` is a set
+# difference over finding tuples, and a finding names a PATH. So a finding
+# cancels only if it is spelled identically on both sides - and a rename
+# respells it. Peer runs `git mv src/y.py src/z.py`; self is holding its own
+# broken import in src/y.py; the merged tree carries that same breakage at
+# src/z.py, which matches nothing in broken(self), and the pair is told it
+# created a collision that one of them brought along. Reproduced: one rename
+# manufactures one false finding per pre-existing finding in the renamed file,
+# on `git mv` - the most ordinary thing an agent does - and on renames
+# specifically, which is the mechanism's own headline example.
+#
+# The fix is to put both parents' findings into the MERGED tree's namespace
+# before subtracting. git already knows the mapping; ask it.
+
+def _rename_map(git, cwd, tree_from, tree_to):
+    """-> {old_path: new_path} for every rename between two trees.
+
+    Parsed from `git diff --name-status -M50% -z`. -z (rather than the
+    tab-separated default) because core.quotePath is on by default and
+    C-quotes any non-ASCII path, which would silently fail to match the
+    checker's own spelling of it; with -z the fields arrive raw and
+    NUL-separated. -M50% is git's own default rename threshold.
+
+    Empty dict on any failure: canonicalisation degrades to the previous
+    behaviour, which is a possible false positive - never to a blocked or
+    errored verdict.
+    """
+    if not tree_from or not tree_to or tree_from == tree_to:
+        return {}
+    rc, out, _err = git(["diff", "--name-status", "-M50%", "-z", tree_from, tree_to], cwd=cwd)
+    if rc != 0:
+        return {}
+    fields = [f for f in out.split("\0") if f != ""]
+    rmap = {}
+    i = 0
+    while i < len(fields):
+        status = fields[i]
+        # R/C carry two paths (old, new); every other status carries one.
+        if status[:1] in ("R", "C") and i + 2 < len(fields):
+            rmap[fields[i + 1]] = fields[i + 2]
+            i += 3
+        else:
+            i += 2
+    return rmap
+
+
+def _canonicalise_findings(findings, rmap):
+    """Rewrite a parent's findings into the merged tree's namespace.
+
+    -> (frozenset, number rewritten). Builtin findings are (path, module,
+    name) tuples: element 0 is replaced when it is a renamed path. An
+    external checker's findings are opaque lines, so only a line that STARTS
+    with a renamed path, followed by end-of-line or one of ':', '(', ' ',
+    '\\t', ',', is rewritten (longest matching old path first, so a rename of
+    both `src/a` and `src/a/b.py` resolves to the more specific one). A line
+    that merely mentions a renamed path somewhere in the middle is left
+    alone: rewriting it would need to understand the checker's format, which
+    is exactly what the --checker contract refuses to assume. That residual
+    is documented in the contract - findings must be path-prefixed to be
+    protected from renames.
+    """
+    if not rmap or not findings:
+        return frozenset(findings), 0
+    olds = sorted(rmap, key=len, reverse=True)
+    out = set()
+    n = 0
+    for item in findings:
+        if isinstance(item, tuple) and item:
+            old = str(item[0])
+            if old in rmap:
+                out.add((rmap[old],) + tuple(item[1:]))
+                n += 1
+                continue
+            out.add(item)
+            continue
+        if isinstance(item, str):
+            rewritten = None
+            for old in olds:
+                if item.startswith(old):
+                    rest = item[len(old):]
+                    if rest == "" or rest[0] in ":( \t,":
+                        rewritten = rmap[old] + rest
+                        break
+            if rewritten is not None:
+                out.add(rewritten)
+                n += 1
+                continue
+        out.add(item)
+    return frozenset(out), n
 
 
 # ------------------------------------------------------------------ finding id
@@ -1572,10 +1766,21 @@ def cmd_verify(git, argv):
                 # peer's worktree, merged <- self's worktree (a deliberate
                 # approximation - see link_directories).
                 peer_linked = link_directories(peer_dir, p["worktree"], links)
-                merged_linked = link_directories(merged_dir, top, links)
+                merged_linked = link_directories_union(merged_dir, top, p["worktree"], links)
                 peer_broken, peer_cov = run_checker(checker, peer_dir, timeout)
                 merged_broken, merged_cov = run_checker(checker, merged_dir, timeout)
-                new_breakage = merged_broken - self_broken - peer_broken
+                # Both parents' findings are respelled into the merged tree's
+                # namespace before the subtraction, or a rename on either side
+                # stops them cancelling (see _rename_map). Computed only when
+                # the merged tree is broken at all: with nothing to cancel
+                # there is nothing to canonicalise, and this is the hot path.
+                rmap_self, rmap_peer = {}, {}
+                if merged_broken:
+                    rmap_self = _rename_map(git, top, my_tree, merged_tree)
+                    rmap_peer = _rename_map(git, top, ptree, merged_tree)
+                self_broken_c, n_self_c = _canonicalise_findings(self_broken, rmap_self)
+                peer_broken_c, n_peer_c = _canonicalise_findings(peer_broken, rmap_peer)
+                new_breakage = merged_broken - self_broken_c - peer_broken_c
                 excluded = 0
                 if verdict == "conflict":
                     # Breakage ON a conflicting path is the textual conflict
@@ -1626,14 +1831,25 @@ def cmd_verify(git, argv):
                     "merged_broken": len(merged_broken),
                     "duration_ms": int((time.time() - t1) * 1000),
                     "self_duration_ms": self_ms,
-                    # Per tree, not a union: an asymmetry (e.g. peer tree got
-                    # no link because the peer worktree lacks the directory,
-                    # while merged borrowed self's) is exactly what explains
-                    # a checker's output failing to cancel - a union hides it.
+                    # Per tree, never summed into one list: an asymmetry (e.g.
+                    # the peer tree got no link because the peer worktree
+                    # lacks the directory) is exactly what explains a
+                    # checker's output failing to cancel - a single union
+                    # list would hide it. self/peer stay plain name lists;
+                    # merged carries provenance per name, because the merged
+                    # tree is the only one that had to borrow from two places
+                    # at once.
                     "linked": {"self": sorted(self_state["linked"]),
                                "peer": sorted(peer_linked),
-                               "merged": sorted(merged_linked)},
+                               "merged": merged_linked},
                 }
+                if rmap_self or rmap_peer:
+                    sem["renames"] = {
+                        "self": [[o, rmap_self[o]] for o in sorted(rmap_self)],
+                        "peer": [[o, rmap_peer[o]] for o in sorted(rmap_peer)],
+                    }
+                if n_self_c or n_peer_c:
+                    sem["canonicalised"] = {"self": n_self_c, "peer": n_peer_c}
                 if verdict == "conflict":
                     # Omitted entirely on the clean path so existing records
                     # stay comparable.
@@ -1701,6 +1917,27 @@ def cmd_verify(git, argv):
         with open(tmp, "w") as f:
             json.dump(records, f)
         os.rename(tmp, os.path.join(ld, name))
+
+    def _linked_union_lines(sem):
+        """Say when the merged tree's linked directory had to be assembled
+        from both worktrees. Informational, never a finding: it explains what
+        the checker was given to read, which is the difference between a real
+        finding and an artifact of where the borrowed directory came from.
+        """
+        merged = ((sem or {}).get("linked") or {}).get("merged")
+        if not isinstance(merged, dict):
+            return
+        for name in sorted(merged):
+            prov = merged[name]
+            if not isinstance(prov, dict) or prov.get("mode") != "union":
+                continue
+            from_peer = prov.get("from_peer") or []
+            count = prov.get("peer_only_count", len(from_peer))
+            shown = ", ".join(from_peer)
+            if count > len(from_peer):
+                shown += " +%d more" % (count - len(from_peer))
+            sys.stdout.write("  linked directory %r: merged tree used self's, plus %d entry/entries "
+                             "only the peer has (%s)\n" % (name, count, shown))
 
     if as_json:
         # tooling output, not agent-facing: includes suppressed findings too
@@ -1803,6 +2040,7 @@ def cmd_verify(git, argv):
                             "clean   with %s (semantic ok: self=%d peer=%d merged=%d broken)\n" %
                             (peer, sem.get("self_broken", 0), sem.get("peer_broken", 0),
                              sem.get("merged_broken", 0)))
+            _linked_union_lines(r.get("semantic"))
     return 0                          # warn-only: always 0
 
 

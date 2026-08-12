@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# test_verify.sh - Verify `moire verify`'s semantic path (V1-V30)
+# test_verify.sh - Verify `moire verify`'s semantic path (V1-V36)
 #
 # `moire check` is textual only and is covered by tests/test_oracle.sh.
 # `moire verify` additionally materialises self/peer/merged trees and runs a
@@ -23,6 +23,10 @@
 #     over distinct finding_ids, never over observations (V25-V28, V30)
 #   - a finding computed from a cached peer snapshot being re-derived against
 #     the peer's current state before it is emitted (V29)
+#   - the two reproduced false-BROKEN classes: a peer's `git mv` relocating
+#     self's own pre-existing breakage (V31-V33) and a peer-installed entry
+#     missing from the merged tree's borrowed directory (V34-V35)
+#   - names bound by top-level compound statements (V36)
 #
 # Exit 0 only if all cases pass; else exit 1 with failure count.
 
@@ -2070,6 +2074,430 @@ test_v29_cached_finding_recomputed() {
     fi
 }
 
+# ---- A6: the two reproduced false-BROKEN classes. Both fire on completely
+# ---- ordinary agent behaviour - a `git mv`, and installing a dependency -
+# ---- and both report one party's own state, or an artifact of where a
+# ---- borrowed directory came from, as a collision the pair created.
+
+# base: src/y.py holds a VALID import. peer: `git mv src/y.py src/z.py`.
+# self: the same file, with an import that resolves nowhere - self's own
+# problem, and nobody else's.
+#
+# The trap this fixture exists to avoid: put the breakage in the BASE and the
+# peer carries it too, so it cancels through peer_broken and the bug does not
+# reproduce at all. It must belong to self alone.
+fixture_rename() {
+    local repo="$1"
+    init_repo "$repo"
+    mkdir -p "$repo/src"
+    printf 'def real_thing():\n    return 1\n' > "$repo/src/lib.py"
+    printf 'from src.lib import real_thing\nreal_thing()\n' > "$repo/src/y.py"
+    : > "$repo/src/__init__.py"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm base >/dev/null 2>&1
+    local base; base=$(git_in "$repo" rev-parse HEAD)
+
+    git_in "$repo" checkout -q "$base" >/dev/null 2>&1
+    git_in "$repo" checkout -q -b branch_b >/dev/null 2>&1
+    git_in "$repo" mv src/y.py src/z.py >/dev/null 2>&1
+    git_in "$repo" commit -qm "peer: git mv src/y.py src/z.py" >/dev/null 2>&1
+
+    git_in "$repo" checkout -q "$base" >/dev/null 2>&1
+    git_in "$repo" checkout -q -b branch_a >/dev/null 2>&1
+    printf 'from src.lib import does_not_exist\ndoes_not_exist()\n' > "$repo/src/y.py"
+    git_in "$repo" commit -qam "self: its own broken import in src/y.py" >/dev/null 2>&1
+}
+
+test_v31_rename_relocated_breakage_cancels() {
+    local num=31 name="peer-rename-does-not-relocate-self-s-own-breakage"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    fixture_rename "$repo" >/dev/null 2>&1
+
+    if ! git_in "$repo" worktree add -q "$test_dir/peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    # GROUND TRUTH, computed without moire: merge the two branches with git's
+    # own merge-tree, materialise the result, and confirm the broken import IS
+    # there, at the renamed path. Silence is only correct if the tool saw the
+    # breakage and attributed it to self - not if it missed it.
+    local gt_tree gt_dir gt_present=no
+    gt_tree=$(git_in "$repo" merge-tree --write-tree branch_a branch_b 2>/dev/null | head -1)
+    gt_dir="$test_dir/ground_truth"
+    mkdir -p "$gt_dir"
+    if [ -n "$gt_tree" ]; then
+        (cd "$repo" && "$GIT_PROG" archive "$gt_tree" | tar -x -C "$gt_dir") >/dev/null 2>&1
+        [ -f "$gt_dir/src/z.py" ] && grep -q "does_not_exist" "$gt_dir/src/z.py" && gt_present=yes
+    fi
+
+    local json
+    json=$(run_verify_uncached "$repo")
+    local summary
+    summary=$(python3 -c "
+import json
+s = json.loads('''$json''')[0]['semantic']
+print('yes' if s['new_breakage'] == [] else 'no',
+      'yes' if (s.get('renames') or {}).get('self') == [['src/y.py', 'src/z.py']] else 'no',
+      s['self_broken'], s['peer_broken'], s['merged_broken'],
+      (s.get('canonicalised') or {}).get('self'))
+" 2>/dev/null)
+    local nb_empty rename_recorded self_broken peer_broken merged_broken canon
+    read -r nb_empty rename_recorded self_broken peer_broken merged_broken canon <<<"$summary"
+
+    if [ "$gt_present" = "yes" ] && [ "$nb_empty" = "yes" ] && [ "$rename_recorded" = "yes" ] \
+       && [ "$self_broken" = "1" ] && [ "$peer_broken" = "0" ] && [ "$merged_broken" = "1" ] \
+       && [ "$canon" = "1" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "ground_truth_breakage_in_merged_tree=$gt_present new_breakage_empty=$nb_empty renames.self=$rename_recorded self=$self_broken peer=$peer_broken merged=$merged_broken canonicalised.self=$canon"
+    fi
+}
+
+test_v32_rename_canonicalises_external_findings() {
+    local num=32 name="peer-rename-cancels-external-checker-findings-too"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+
+    init_repo "$repo"
+    mkdir -p "$repo/src"
+    printf 'ok\n' > "$repo/src/y.txt"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm base >/dev/null 2>&1
+    local base; base=$(git_in "$repo" rev-parse HEAD)
+
+    git_in "$repo" checkout -q -b branch_b >/dev/null 2>&1
+    git_in "$repo" mv src/y.txt src/z.txt >/dev/null 2>&1
+    git_in "$repo" commit -qm "peer: git mv src/y.txt src/z.txt" >/dev/null 2>&1
+
+    git_in "$repo" checkout -q "$base" >/dev/null 2>&1
+    git_in "$repo" checkout -q -b branch_a >/dev/null 2>&1
+    printf 'BAD 1\nBAD 2\nBAD 3\nBAD 4\nBAD 5\n' > "$repo/src/y.txt"
+    git_in "$repo" commit -qam "self: five of its own findings in src/y.txt" >/dev/null 2>&1
+
+    if ! git_in "$repo" worktree add -q "$test_dir/peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    # A path-prefixed external checker, the shape the --checker contract asks
+    # for: "<path>:<line>: <message>". Five findings, all in one file, all
+    # self's own - and the merged tree spells that file's path differently.
+    local checker="$test_dir/checker.sh"
+    cat > "$checker" <<'CHK'
+#!/bin/sh
+for f in src/*.txt; do
+  [ -f "$f" ] || continue
+  grep -n 'BAD' "$f" | while IFS=: read -r n _rest; do
+    echo "$f:$n: bad marker"
+  done
+done
+CHK
+    chmod +x "$checker"
+
+    local json
+    json=$(run_verify_uncached "$repo" --checker "$checker")
+    local summary
+    summary=$(python3 -c "
+import json
+s = json.loads('''$json''')[0]['semantic']
+print('yes' if s['new_breakage'] == [] else 'no',
+      (s.get('canonicalised') or {}).get('self'), s['self_broken'], s['merged_broken'])
+" 2>/dev/null)
+    local nb_empty canon self_broken merged_broken
+    read -r nb_empty canon self_broken merged_broken <<<"$summary"
+
+    if [ "$nb_empty" = "yes" ] && [ "$canon" = "5" ] && [ "$self_broken" = "5" ] \
+       && [ "$merged_broken" = "5" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "new_breakage_empty=$nb_empty canonicalised.self=$canon self_broken=$self_broken merged_broken=$merged_broken"
+    fi
+}
+
+test_v33_rename_true_positive_still_reported() {
+    local num=33 name="rename-canonicalisation-does-not-swallow-a-real-collision"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+
+    # The peer renames a file AND removes a name; self adds a brand-new file
+    # that references that name. Disjoint file sets, clean textual merge, and
+    # a genuine collision that must survive canonicalisation.
+    init_repo "$repo"
+    mkdir -p "$repo/src"
+    : > "$repo/src/__init__.py"
+    printf 'def used_name():\n    return 1\n' > "$repo/src/lib.py"
+    printf 'x = 1\n' > "$repo/src/y.py"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm base >/dev/null 2>&1
+    local base; base=$(git_in "$repo" rev-parse HEAD)
+
+    git_in "$repo" checkout -q -b branch_b >/dev/null 2>&1
+    git_in "$repo" mv src/y.py src/z.py >/dev/null 2>&1
+    printf 'def renamed_name():\n    return 1\n' > "$repo/src/lib.py"
+    git_in "$repo" commit -qam "peer: git mv, and rename used_name away" >/dev/null 2>&1
+
+    git_in "$repo" checkout -q "$base" >/dev/null 2>&1
+    git_in "$repo" checkout -q -b branch_a >/dev/null 2>&1
+    printf 'from src.lib import used_name\nused_name()\n' > "$repo/src/new_caller.py"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm "self: new file calling used_name" >/dev/null 2>&1
+
+    if ! git_in "$repo" worktree add -q "$test_dir/peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    local json human
+    json=$(run_verify_uncached "$repo")
+    human=$(cd "$repo" && MOIRE_CACHE_TTL=0 MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" verify 2>/dev/null)
+
+    local summary
+    summary=$(python3 -c "
+import json
+s = json.loads('''$json''')[0]['semantic']
+nb = s['new_breakage']
+# The rename shows up in the SELF->merged map: self is the side that still
+# spells the file src/y.py, the peer already renamed it.
+print('yes' if nb == [['src/new_caller.py', 'src.lib', 'used_name']] else 'no',
+      'yes' if (s.get('renames') or {}).get('self') == [['src/y.py', 'src/z.py']] else 'no',
+      s['self_broken'], s['peer_broken'])
+" 2>/dev/null)
+    local nb_right rename_seen self_broken peer_broken
+    read -r nb_right rename_seen self_broken peer_broken <<<"$summary"
+
+    local broken_line=no
+    echo "$human" | grep -q '^BROKEN' && broken_line=yes
+
+    if [ "$nb_right" = "yes" ] && [ "$rename_seen" = "yes" ] && [ "$self_broken" = "0" ] \
+       && [ "$peer_broken" = "0" ] && [ "$broken_line" = "yes" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "new_breakage_is_the_real_one=$nb_right rename_recorded=$rename_seen self=$self_broken peer=$peer_broken printed_BROKEN=$broken_line"
+    fi
+}
+
+# The peer installs something into its own linked directory and commits code
+# that uses it. The merged tree has the peer's code and (before this fix)
+# self's directory, so the checker cannot resolve the entry - reported as
+# breakage the pair created, which it is not.
+fixture_link_union() {
+    local repo="$1"
+    init_repo "$repo"
+    mkdir -p "$repo/src"
+    printf 'deps/\n' > "$repo/.gitignore"
+    printf 'import a\n' > "$repo/src/app.py"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm base >/dev/null 2>&1
+    local base; base=$(git_in "$repo" rev-parse HEAD)
+
+    git_in "$repo" checkout -q -b branch_b >/dev/null 2>&1
+    printf 'import b\n' > "$repo/src/newfeature.py"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm "peer: add src/newfeature.py using b" >/dev/null 2>&1
+
+    git_in "$repo" checkout -q "$base" >/dev/null 2>&1
+    git_in "$repo" checkout -q -b branch_a >/dev/null 2>&1
+    printf 'import a\n# self edits its own file\n' > "$repo/src/app.py"
+    git_in "$repo" commit -qam "self: edit src/app.py" >/dev/null 2>&1
+}
+
+# A stand-in for a real toolchain, with zero package-manager knowledge in it:
+# every `import X` at the top of a src file must have a matching deps/X entry
+# in the tree the checker was given.
+write_deps_checker() {
+    local path="$1"
+    cat > "$path" <<'CHK'
+#!/bin/sh
+for f in src/*.py; do
+  [ -f "$f" ] || continue
+  grep -o '^import [A-Za-z_][A-Za-z0-9_]*' "$f" | awk '{print $2}' | while read -r m; do
+    [ -d "deps/$m" ] || echo "$f: cannot resolve module $m"
+  done
+done
+CHK
+    chmod +x "$path"
+}
+
+test_v34_link_union_covers_peer_added_entry() {
+    local num=34 name="merged-tree-links-the-union-of-both-worktrees"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    fixture_link_union "$repo" >/dev/null 2>&1
+
+    local peer="$test_dir/peer"
+    if ! git_in "$repo" worktree add -q "$peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    # self has only `a`; the peer installed `b` alongside it.
+    mkdir -p "$repo/deps/a" "$peer/deps/a" "$peer/deps/b"
+    : > "$repo/deps/a/entry"; : > "$peer/deps/a/entry"; : > "$peer/deps/b/entry"
+
+    local checker="$test_dir/checker.sh"
+    write_deps_checker "$checker"
+
+    local json human
+    json=$(run_verify_uncached "$repo" --checker "$checker" --link deps)
+    human=$(cd "$repo" && MOIRE_CACHE_TTL=0 MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" verify \
+            --checker "$checker" --link deps 2>/dev/null)
+
+    local summary
+    summary=$(python3 -c "
+import json
+s = json.loads('''$json''')[0]['semantic']
+m = (s.get('linked') or {}).get('merged') or {}
+d = m.get('deps') or {}
+print('yes' if s['new_breakage'] == [] else 'no', d.get('mode'),
+      'yes' if d.get('from_peer') == ['b'] else 'no', d.get('peer_only_count'))
+" 2>/dev/null)
+    local nb_empty mode from_peer peer_only
+    read -r nb_empty mode from_peer peer_only <<<"$summary"
+
+    local says_union=no
+    echo "$human" | grep -q "linked directory 'deps'" && says_union=yes
+
+    if [ "$nb_empty" = "yes" ] && [ "$mode" = "union" ] && [ "$from_peer" = "yes" ] \
+       && [ "$peer_only" = "1" ] && [ "$says_union" = "yes" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "new_breakage_empty=$nb_empty mode=$mode from_peer_is_b=$from_peer peer_only_count=$peer_only human_names_it=$says_union"
+    fi
+}
+
+test_v35_link_union_both_present_prefers_self() {
+    local num=35 name="union-prefers-self-for-both-present-entries"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    fixture_link_union "$repo" >/dev/null 2>&1
+
+    local peer="$test_dir/peer"
+    if ! git_in "$repo" worktree add -q "$peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    # Both worktrees have deps/a, with DIFFERENT content, and the peer also
+    # has deps/b. The checker reports the content of deps/a it can see, so
+    # whose copy the merged tree used is directly observable: if it used
+    # self's, merged's finding is identical to self's and cancels.
+    mkdir -p "$repo/deps/a" "$peer/deps/a" "$peer/deps/b"
+    printf 'self copy\n' > "$repo/deps/a/VERSION"
+    printf 'peer copy\n' > "$peer/deps/a/VERSION"
+    : > "$peer/deps/b/entry"
+
+    local checker="$test_dir/checker.sh"
+    cat > "$checker" <<'CHK'
+#!/bin/sh
+echo "deps/a/VERSION: $(cat deps/a/VERSION 2>/dev/null || echo missing)"
+CHK
+    chmod +x "$checker"
+
+    local json rc
+    json=$(run_verify_uncached "$repo" --checker "$checker" --link deps)
+    rc=$?
+
+    local summary
+    summary=$(python3 -c "
+import json
+s = json.loads('''$json''')[0]['semantic']
+d = ((s.get('linked') or {}).get('merged') or {}).get('deps') or {}
+print('yes' if s['new_breakage'] == [] else 'no', d.get('mode'), s['merged_broken'])
+" 2>/dev/null)
+    local nb_empty mode merged_broken
+    read -r nb_empty mode merged_broken <<<"$summary"
+
+    # And with no divergence in the entry SETS (both have exactly deps/a,
+    # still different content) there is no union to build: self's directory is
+    # linked whole, exactly as before.
+    rm -rf "$peer/deps/b"
+    local json2 mode2
+    json2=$(run_verify_uncached "$repo" --checker "$checker" --link deps)
+    mode2=$(python3 -c "
+import json
+s = json.loads('''$json2''')[0]['semantic']
+print((((s.get('linked') or {}).get('merged') or {}).get('deps') or {}).get('mode'))
+" 2>/dev/null)
+
+    if [ "$rc" -eq 0 ] && [ "$nb_empty" = "yes" ] && [ "$mode" = "union" ] \
+       && [ "$merged_broken" = "1" ] && [ "$mode2" = "self" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "exit=$rc new_breakage_empty=$nb_empty mode=$mode merged_broken=$merged_broken mode_without_divergence=$mode2"
+    fi
+}
+
+test_v36_toplevel_compound_statements_bind_names() {
+    local num=36 name="builtin-ast-sees-names-bound-in-top-level-for-while-with"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+
+    # Self adds an importer of a module that does not exist on its side; the
+    # peer adds that module, binding every name inside a top-level compound
+    # statement. Only the MERGED tree has both, so nothing cancels: a checker
+    # that cannot see a name bound by `for`/`while`/`with` reports the merged
+    # pair as newly broken over three names that are really there.
+    init_repo "$repo"
+    printf 'x = 1\n' > "$repo/other.py"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm base >/dev/null 2>&1
+    local base; base=$(git_in "$repo" rev-parse HEAD)
+
+    git_in "$repo" checkout -q -b branch_a >/dev/null 2>&1
+    printf 'from newmod import FROM_FOR, FROM_WHILE, FROM_WITH\nprint(FROM_FOR, FROM_WHILE, FROM_WITH)\n' > "$repo/self_caller.py"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm "self: new importer of a module it does not have" >/dev/null 2>&1
+
+    git_in "$repo" checkout -q "$base" >/dev/null 2>&1
+    git_in "$repo" checkout -q -b branch_b >/dev/null 2>&1
+    printf 'import io\n\nfor _i in (1,):\n    FROM_FOR = 1\n\nwhile True:\n    FROM_WHILE = 2\n    break\n\nwith io.StringIO() as _f:\n    FROM_WITH = 3\n' > "$repo/newmod.py"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm "peer: add newmod.py binding names in compound statements" >/dev/null 2>&1
+    git_in "$repo" checkout -q branch_a >/dev/null 2>&1
+
+    if ! git_in "$repo" worktree add -q "$test_dir/peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    local json
+    json=$(run_verify_uncached "$repo")
+    local summary
+    summary=$(python3 -c "
+import json
+s = json.loads('''$json''')[0]['semantic']
+print('yes' if s['new_breakage'] == [] else 'no', s['merged_broken'], s['peer_broken'])
+" 2>/dev/null)
+    local nb_empty merged_broken peer_broken
+    read -r nb_empty merged_broken peer_broken <<<"$summary"
+
+    if [ "$nb_empty" = "yes" ] && [ "$merged_broken" = "0" ] && [ "$peer_broken" = "0" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "new_breakage_empty=$nb_empty merged_broken=$merged_broken peer_broken=$peer_broken"
+    fi
+}
+
 # === MAIN ===
 
 main() {
@@ -2119,6 +2547,12 @@ main() {
     test_v28_semantic_finding_id_symmetric
     test_v30_pre_v2_records_ignored_not_fatal
     test_v29_cached_finding_recomputed
+    test_v31_rename_relocated_breakage_cancels
+    test_v32_rename_canonicalises_external_findings
+    test_v33_rename_true_positive_still_reported
+    test_v34_link_union_covers_peer_added_entry
+    test_v35_link_union_both_present_prefers_self
+    test_v36_toplevel_compound_statements_bind_names
 
     # Print summary
     local total=$((PASSED + FAILED + SKIPPED))
