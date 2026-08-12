@@ -1,6 +1,6 @@
 {
   "name": "@jamescazzetta/moire",
-  "version": "0.10.0",
+  "version": "0.12.0",
   "description": "Tells parallel AI coding agents when their in-flight work would break each other — before either lands. Catches the case git merges cleanly.",
   "keywords": [
     "ai-agents",
