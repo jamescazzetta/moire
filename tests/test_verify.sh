@@ -12,7 +12,7 @@
 #     only, with conflict-path exclusion (V8-V10)
 #   - self checked once per `verify` call, not once per peer (V11)
 #   - --link, for non-Python checkers that need a dependency directory (V12-V14)
-#   - `report`/`report --study` surfacing the semantic dimension (V15-V16)
+#   - `report` surfacing the semantic dimension (V15-V16)
 #   - no DeprecationWarning noise on Python >= 3.12 (V17)
 #   - doctor's new [warn] level for a missing dependency dir (V18)
 #   - the checker never claiming "semantic ok" about a tree it could not
@@ -787,8 +787,7 @@ test_v6_v7_external_checker_whole_string() {
     # Embedding that raw text into a python triple-quoted string (as
     # json_get/json_has do, and as most other cases here do) corrupts it:
     # python's own string-literal parsing consumes the backslash before
-    # json.loads ever sees it. Route through a file instead, same as
-    # test_study.sh's test_004/006/007 do for their more complex cases.
+    # json.loads ever sees it. Route through a file instead.
     local json_file="$test_dir/v6.json"
     printf '%s' "$json" > "$json_file"
 
@@ -1266,7 +1265,7 @@ print(d.get('textual_rate'), d.get('broken_pair_states'))
 }
 
 test_v16_report_skipped_semantic_checks() {
-    local num=16 name="report-skipped-semantic-checks-both-modes"
+    local num=16 name="report-skipped-semantic-checks"
     local test_dir; test_dir=$(new_case_dir "v$num")
     trap "rm -rf '$test_dir'" RETURN
     local repo="$test_dir/repo"
@@ -1283,19 +1282,16 @@ test_v16_report_skipped_semantic_checks() {
         return
     fi
 
-    local plain study
+    local plain
     plain=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report --json 2>/dev/null)
-    study=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report --study --json 2>/dev/null)
 
-    local plain_skipped study_skipped
+    local plain_skipped
     plain_skipped=$(json_get "$plain" "skipped_semantic_checks" 0)
-    study_skipped=$(json_get "$study" "skipped_semantic_checks" 0)
 
-    if [ -n "$plain_skipped" ] && [ "$plain_skipped" -ge 1 ] \
-       && [ -n "$study_skipped" ] && [ "$study_skipped" -ge 1 ]; then
+    if [ -n "$plain_skipped" ] && [ "$plain_skipped" -ge 1 ]; then
         report_result $num "$name" "PASS"
     else
-        report_result $num "$name" "FAIL" "report.skipped_semantic_checks=$plain_skipped report_study.skipped_semantic_checks=$study_skipped"
+        report_result $num "$name" "FAIL" "report.skipped_semantic_checks=$plain_skipped"
     fi
 }
 
@@ -1668,21 +1664,19 @@ test_v23_report_excludes_unperformed() {
         return
     fi
 
-    local ts_report ts_study ts_human
+    local ts_report ts_human
     ts_report=$(cd "$ts_repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report --json 2>/dev/null)
-    ts_study=$(cd "$ts_repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report --study --json 2>/dev/null)
     ts_human=$(cd "$ts_repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report 2>/dev/null)
 
     local summary
     summary=$(python3 -c "
 import json
 d = json.loads('''$ts_report''')
-s = json.loads('''$ts_study''')
 print(d.get('unperformed_semantic_checks'), d.get('semantic_pair_states_performed'),
-      d.get('semantic_rate'), s.get('unperformed_semantic_checks'))
+      d.get('semantic_rate'))
 " 2>/dev/null)
-    local unperformed pairs rate study_unperformed
-    read -r unperformed pairs rate study_unperformed <<<"$summary"
+    local unperformed pairs rate
+    read -r unperformed pairs rate <<<"$summary"
 
     local human_na
     human_na=no
@@ -1705,12 +1699,12 @@ print(d.get('unperformed_semantic_checks'), d.get('semantic_pair_states_performe
     py_pairs=$(json_get "$py_report" "semantic_pair_states_performed" 0)
 
     if [ "${unperformed:-0}" -ge 1 ] && [ "${pairs:-1}" -eq 0 ] && [ "$rate" = "None" ] \
-       && [ "$human_na" = "yes" ] && [ "${study_unperformed:-0}" -ge 1 ] \
+       && [ "$human_na" = "yes" ] \
        && [ -n "$py_pairs" ] && [ "$py_pairs" -ge 1 ]; then
         report_result $num "$name" "PASS"
     else
         report_result $num "$name" "FAIL" \
-            "ts: unperformed=$unperformed semantic_pair_states=$pairs semantic_rate=$rate human_na=$human_na study_unperformed=$study_unperformed; python: semantic_pair_states=$py_pairs"
+            "ts: unperformed=$unperformed semantic_pair_states=$pairs semantic_rate=$rate human_na=$human_na; python: semantic_pair_states=$py_pairs"
     fi
 }
 
@@ -2501,10 +2495,12 @@ print('yes' if s['new_breakage'] == [] else 'no', s['merged_broken'], s['peer_br
 # === MAIN ===
 
 main() {
-    # Check if bin/moire exists and is executable
+    # A missing/stub binary is a FAIL, not a silent SKIP: a suite that exits 0
+    # whenever the tool is absent proves nothing about the tool. See
+    # tests/negative_control.sh, which stubs MOIRE_BIN and asserts this.
     if [ ! -x "$MOIRE_BIN" ]; then
-        echo "SKIP: bin/moire not present"
-        exit 0
+        echo "FAIL: bin/moire not present or not executable ($MOIRE_BIN)"
+        exit 1
     fi
 
     # Find suitable git

@@ -607,10 +607,12 @@ test_case() {
 # === MAIN ===
 
 main() {
-    # Check if bin/moire exists and is executable
+    # A missing/stub binary is a FAIL, not a silent SKIP: a suite that exits 0
+    # whenever the tool is absent proves nothing about the tool. See
+    # tests/negative_control.sh, which stubs MOIRE_BIN and asserts this.
     if [ ! -x "$MOIRE_BIN" ]; then
-        echo "SKIP: bin/moire not present"
-        exit 0
+        echo "FAIL: bin/moire not present or not executable ($MOIRE_BIN)"
+        exit 1
     fi
 
     # Find suitable git

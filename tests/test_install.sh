@@ -12,7 +12,7 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-MOIRE_BIN="${REPO_ROOT}/bin/moire"
+MOIRE_BIN="${MOIRE_BIN:-${REPO_ROOT}/bin/moire}"
 MOIRE_GIT="${MOIRE_GIT:-/opt/homebrew/bin/git}"
 
 # Fallback to /usr/bin/git if homebrew not available
@@ -172,8 +172,11 @@ PY
 # ============================================================================
 
 if ! check_moire_available; then
-	echo "SKIP: bin/moire not present or not executable"
-	exit 0
+	# A missing/stub binary is a FAIL, not a silent SKIP: a suite that exits 0
+	# whenever the tool is absent proves nothing about the tool. See
+	# tests/negative_control.sh, which stubs MOIRE_BIN and asserts this.
+	echo "FAIL: bin/moire not present or not executable ($MOIRE_BIN)"
+	exit 1
 fi
 
 if ! check_git_version; then

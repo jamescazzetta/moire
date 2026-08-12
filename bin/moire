@@ -27,10 +27,12 @@ Python 3.8 compatible, stdlib only.
 
 import ast
 import difflib
+import filecmp
 import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -69,7 +71,6 @@ SNAPSHOT_ENV = {
 HOOK_MARKER = "# >>> moire hook >>>"
 HOOKS = ("post-commit", "post-merge")
 DEFAULT_CACHE_TTL = 2.0
-NOTE_MAX_CHARS = 200
 
 
 # ---------------------------------------------------------------- git plumbing
@@ -109,10 +110,11 @@ def find_git():
             return None, (0, 0)
         rc, out, _ = _run([forced, "--version"])
         return (forced, _parse_version(out)) if rc == 0 else (None, (0, 0))
-    cands = ["/opt/homebrew/bin/git"]
+    cands = []
     w = shutil.which("git")
     if w:
         cands.append(w)
+    cands.append("/opt/homebrew/bin/git")
     cands.append("/usr/bin/git")
     best = (None, (0, 0))
     for c in cands:
@@ -171,10 +173,6 @@ def log_dir(cd):
 
 def cache_dir(cd):
     return os.path.join(state_dir(cd), "cache")
-
-
-def notes_dir(cd):
-    return os.path.join(state_dir(cd), "notes")
 
 
 def installed_bin(cd):
@@ -796,12 +794,29 @@ def run_checker(checker, directory, timeout):
     if checker == "builtin-ast":
         broken, examined, total = _broken_in_tree(directory)
         return frozenset(broken), {"examined": examined, "total": total}
+    # `checker` runs via a shell, so its pid is the SHELL's, not necessarily
+    # the real checker's (a pipeline, or a shell that execs something that
+    # forks) - killing just that pid on timeout can leave the actual checker
+    # running, orphaned, still writing into the materialised tree we are
+    # about to rmtree. start_new_session=True makes this process the leader
+    # of a fresh process group (POSIX only), so killpg on timeout reaches the
+    # whole tree of descendants at once. Where that is unavailable (no
+    # os.setsid - non-POSIX platforms), fall back to killing just the one
+    # pid: less thorough, never worse than before this fix.
+    posix_group = hasattr(os, "setsid") and hasattr(os, "killpg")
     p = subprocess.Popen(checker, shell=True, cwd=directory,
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         start_new_session=posix_group)
     try:
         out, _err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        p.kill()
+        if posix_group:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                p.kill()
+        else:
+            p.kill()
         p.communicate()
         raise
     lines = set(ln for ln in out.decode("utf-8", "replace").split("\n") if ln.strip())
@@ -910,9 +925,8 @@ def _canonicalise_findings(findings, rmap):
 # a tree OID, timestamp, or check_id, all of which change on every single
 # check even when the underlying collision has not moved at all. That
 # stability is what makes recurrence ("still there 20 checks later") and
-# dissolution ("gone now") measurable, and it is what `moire explain` keys notes
-# on: a note attached today must still be findable against the same collision
-# tomorrow.
+# dissolution ("gone now") measurable - and what makes `report`'s
+# distinct-finding count mean the same thing across the whole log.
 
 def _finding_tokens(rec):
     """-> the sorted identity tokens for a check/verify record's finding, or []
@@ -953,12 +967,10 @@ def compute_finding_id(self_worktree, peer_worktree, tokens):
     """-> 12-hex-char id, or None if `tokens` is empty (nothing to identify).
 
     MUST be symmetric: the same collision observed from either worktree has
-    to yield the identical id, or suppression (each side would roll its own
-    hash -> an unintended one-sided-warning arm) and `moire explain` (an agent
-    files a note under its own id; the peer looks up a different id and never
-    finds it) both silently break. Sorting the two worktree paths before
-    hashing is what buys that - the pair {A, B} hashes the same regardless of
-    which one is "self" for this call.
+    to yield the identical id, or `report`'s distinct-finding count would
+    silently double-count every collision (once per side). Sorting the two
+    worktree paths before hashing is what buys that - the pair {A, B} hashes
+    the same regardless of which one is "self" for this call.
 
     Consequence of keying on the full tokens (see _finding_tokens): an
     EVOLVING collision - one whose contested path set or breakage set grows -
@@ -975,191 +987,6 @@ def compute_finding_id(self_worktree, peer_worktree, tokens):
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
     return h.hexdigest()[:12]
-
-
-# ------------------------------------------------------------- surface arm
-#
-# The project's central question - does an in-flight warning change an
-# agent's behaviour, or is it an expensive no-op - cannot be answered by a
-# between-run A/B: LLM nondeterminism and task-difficulty variance swamp the
-# effect. The alternative is a matched design: every finding is computed and
-# LOGGED regardless, but only a randomised subset is SHOWN to the agent. The
-# assignment must be deterministic on finding_id (never on check_id, a
-# timestamp, or anything that changes run to run) so a given collision lands
-# in the same arm - surfaced or suppressed - every single time it recurs,
-# on both sides. A collision that flickered between arms would contaminate
-# exactly the "does persistence differ by arm" measurement this exists to
-# make possible.
-
-DEFAULT_SURFACE_RATE = 1.0
-
-
-def surface_rate():
-    v = os.environ.get("MOIRE_SURFACE_RATE")
-    if v:
-        try:
-            return float(v)
-        except ValueError:
-            pass
-    return DEFAULT_SURFACE_RATE
-
-
-def surface_salt():
-    """Empty by default; set MOIRE_SURFACE_SALT to a fresh value to re-randomise
-    the surfaced/suppressed assignment for a new study window without
-    changing MOIRE_SURFACE_RATE."""
-    return os.environ.get("MOIRE_SURFACE_SALT", "")
-
-
-def is_surfaced(finding_id, rate, salt):
-    """-> True if this finding should be SHOWN to the agent, at the given
-    rate/salt. Deterministic on finding_id: same id, same rate, same salt
-    always yields the same answer, independent of which side asks or how
-    many times. Short-circuits at the extremes so `rate=1.0` (the default,
-    "surface everything") never touches the hash, and `rate<=0.0` never
-    admits a false positive from a boundary float.
-    """
-    if rate >= 1.0:
-        return True
-    if rate <= 0.0:
-        return False
-    h = hashlib.sha1((salt + finding_id).encode("utf-8")).hexdigest()
-    return (int(h[:8], 16) / 0xFFFFFFFF) < rate
-
-
-# ---------------------------------------------------------------- agent id
-#
-# A label, nothing more. It lets a study split findings cross-agent vs
-# same-agent - the split this project needs because the statistic that used
-# to justify that split as important was found fabricated, not because the
-# label itself is trusted for anything. It MUST NOT reach oracle(),
-# compute_arbiter(), compute_finding_id(), or is_surfaced() - none of those
-# functions take it as an argument, which is the structural guarantee (not a
-# discipline to remember) that an agent's self-declared identity can never
-# move a verdict, a suppression decision, or an arbiter recommendation.
-
-def _agent_marker_file(cd, worktree):
-    h = hashlib.sha1(worktree.encode("utf-8")).hexdigest()[:16]
-    return os.path.join(state_dir(cd), "agents", h + ".json")
-
-
-def write_agent_marker(cd, worktree, agent_id):
-    """Record `worktree`'s current MOIRE_AGENT_ID for peers to read. Temp-file +
-    os.rename, same pattern as the log shards and snapshot cache: a reader
-    never observes a partially-written marker.
-    """
-    d = os.path.join(state_dir(cd), "agents")
-    try:
-        os.makedirs(d)
-    except OSError:
-        pass
-    rec = {"worktree": worktree, "agent_id": agent_id,
-           "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
-    path = _agent_marker_file(cd, worktree)
-    tmp = "%s.tmp-%d-%s" % (path, os.getpid(), uuid.uuid4().hex[:6])
-    try:
-        with open(tmp, "w") as f:
-            json.dump(rec, f)
-        os.rename(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-
-
-def read_agent_marker(cd, worktree):
-    """-> the peer's declared agent_id, or None if its marker is missing,
-    unparsable, or has never been written (e.g. it has not run `moire
-    check`/`verify` since this feature shipped)."""
-    if not cd:
-        return None
-    try:
-        with open(_agent_marker_file(cd, worktree)) as f:
-            rec = json.load(f)
-    except Exception:
-        return None
-    return rec.get("agent_id")
-
-
-# --------------------------------------------------------------- explain notes
-#
-# Notes are agent-authored, untrusted text about to enter ANOTHER agent's
-# context (the peer's, via its own `moire check`/`verify` output). They are
-# rendered strictly AFTER a verdict is final: every function below only
-# READS already-computed records (verdict, conflict_paths, semantic,
-# finding_id) and only ever ADDS a "peer_notes" key. None of them are called
-# from, or pass anything into, oracle()/oracle_tree()/run_checker()/
-# compute_arbiter() - the functions that actually decide a verdict. This is
-# the enforcement of the non-negotiable rule that declared text cannot move a
-# verdict: it is not a discipline the code has to remember to uphold, it is a
-# consequence of which functions call which.
-
-def _sanitize_note_text(text, maxlen=NOTE_MAX_CHARS):
-    """Strip control characters (this is untrusted text entering another
-    agent's context) and cap length. Applied both when a note is written and
-    again whenever one is displayed/embedded, so a note file edited by hand
-    outside `moire explain` cannot smuggle more than a plain capped sentence.
-    """
-    cleaned = "".join(ch for ch in text if ch == " " or ch == "\t" or ord(ch) >= 32)
-    cleaned = cleaned.strip()
-    return cleaned[:maxlen]
-
-
-def read_notes_for(cd, finding_id, peer_worktree):
-    """-> [{'ts':..., 'text':...}, ...] sorted oldest-first: every note filed
-    against `finding_id` whose author worktree is `peer_worktree` - i.e. only
-    notes the PEER wrote about THIS finding, never our own. Missing notes dir,
-    unparsable note file, or no finding_id all resolve to [].
-    """
-    if not finding_id or not cd:
-        return []
-    nd = notes_dir(cd)
-    if not os.path.isdir(nd):
-        return []
-    try:
-        names = os.listdir(nd)
-    except OSError:
-        return []
-    peer_real = os.path.realpath(peer_worktree)
-    prefix = finding_id + "-"
-    out = []
-    for fn in names:
-        if not fn.startswith(prefix) or not fn.endswith(".json"):
-            continue
-        try:
-            with open(os.path.join(nd, fn)) as f:
-                note = json.load(f)
-        except Exception:
-            continue
-        nw = note.get("worktree")
-        if not nw or os.path.realpath(nw) != peer_real:
-            continue
-        text = _sanitize_note_text(str(note.get("text") or ""))
-        if not text:
-            continue
-        # `source` distinguishes a pre-existing task description (written before
-        # the work, by whoever dispatched it) from an agent's post-hoc account of
-        # itself. Those are different epistemic objects and must not be conflated:
-        # an agent's account of its own scope is unreliable; a task description
-        # is not a self-report at all. Unknown/absent -> "agent", the weaker
-        # assumption.
-        src = note.get("source")
-        if src not in ("task", "agent", "human"):
-            src = "agent"
-        out.append({"ts": note.get("ts"), "source": src, "text": text})
-    out.sort(key=lambda n: n.get("ts") or "")
-    return out
-
-
-def decorate_with_notes(records, cd):
-    """Second pass, run only AFTER every record's verdict/finding_id is final.
-    Adds "peer_notes"; never touches verdict, conflict_paths, or semantic.
-    """
-    for rec in records:
-        fid = rec.get("finding_id")
-        peer_wt = (rec.get("peer") or {}).get("worktree")
-        rec["peer_notes"] = read_notes_for(cd, fid, peer_wt) if (fid and peer_wt) else []
 
 
 # -------------------------------------------------------------------- arbiter
@@ -1310,7 +1137,7 @@ COMMAND_USAGE = {
     "check": "usage: moire check [--json] [--peers a,b]",
     "verify": ("usage: moire verify [--json] [--peers a,b] [--checker <cmd>] "
                "[--link <name>]..."),
-    "report": "usage: moire report [--json] [--study]",
+    "report": "usage: moire report [--json]",
     "doctor": "usage: moire doctor",
     "install": "usage: moire install [--print-client-hooks]",
 }
@@ -1436,10 +1263,8 @@ def cmd_check(git, argv):
     check_id = str(uuid.uuid4())
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     records = []
-    rate, salt = surface_rate(), surface_salt()
-    agent_id = os.environ.get("MOIRE_AGENT_ID")     # a label only - see the module note above write_agent_marker
-    if cd:
-        write_agent_marker(cd, top, agent_id)
+    agent_id = os.environ.get("MOIRE_AGENT_ID")     # a provenance label recorded on OUR OWN record only;
+                                                      # never read by any predicate (verdict, arbiter, finding_id)
 
     # Self is ALWAYS recomputed - never served from cache. The agent invoking
     # `moire check` just wrote; a stale self-snapshot is the one error that would
@@ -1467,8 +1292,7 @@ def cmd_check(git, argv):
             "self": {"worktree": top, "branch": me.get("branch"),
                      "head": me.get("head"), "tree": my_tree, "agent_id": agent_id},
             "peer": {"worktree": p["worktree"], "branch": p.get("branch"),
-                     "head": phead, "tree": None,
-                     "agent_id": read_agent_marker(cd, p["worktree"]) if cd else None},
+                     "head": phead, "tree": None},
             "verdict": "error", "conflict_paths": [],
             "git_version": git.version_str, "oracle": "merge-tree --write-tree",
             "duration_ms": 0, "error": None,
@@ -1477,8 +1301,6 @@ def cmd_check(git, argv):
             # fresh peer snapshot, so the verdict below is not the cache's.
             "cached": {"self": False, "peer": False, "peer_recomputed": False},
             "finding_id": None, "arbiter": None,
-            # unaffected by suppression when there is no finding to suppress
-            "surfaced": True, "surface_rate": rate, "surface_salt": salt,
         }
         try:
             if my_err:
@@ -1504,7 +1326,6 @@ def cmd_check(git, argv):
             fid = compute_finding_id(top, p["worktree"], _finding_tokens(rec))
             rec["finding_id"] = fid
             if fid:
-                rec["surfaced"] = is_surfaced(fid, rate, salt)
                 rec["arbiter"] = compute_arbiter(git, top, self_info, peer_info,
                                                  my_tree, my_commit, ptree, pcommit)
         except Exception as ex:
@@ -1512,11 +1333,6 @@ def cmd_check(git, argv):
             rec["error"] = str(ex)
         rec["duration_ms"] = int((time.time() - t0) * 1000)
         records.append(rec)
-
-    # Notes are read ONLY here, strictly after every verdict above is final -
-    # this pass reads finding_id/peer worktree and adds "peer_notes"; it never
-    # feeds anything back into a verdict.
-    decorate_with_notes(records, cd)
 
     # one shard file per invocation - never a shared append file
     if cd:
@@ -1533,7 +1349,6 @@ def cmd_check(git, argv):
         os.rename(tmp, os.path.join(ld, name))
 
     if as_json:
-        # tooling output, not agent-facing: includes suppressed findings too
         sys.stdout.write(json.dumps(records, indent=2) + "\n")
     else:
         if not records:
@@ -1541,14 +1356,10 @@ def cmd_check(git, argv):
         for r in records:
             peer = r["peer"]["worktree"]
             if r["verdict"] == "conflict":
-                if not r.get("surfaced", True):
-                    continue           # suppressed: logged above in full, but the agent sees nothing
                 sys.stdout.write("CONFLICT with %s (%s) [finding %s]\n" %
                                  (peer, r["peer"]["branch"] or "detached", r.get("finding_id")))
                 for pth in r["conflict_paths"]:
                     sys.stdout.write("    %s\n" % pth)
-                for note in r.get("peer_notes") or []:
-                    sys.stdout.write("    peer (%s): %s\n" % (note.get("source","agent"), note["text"]))
                 arb = r.get("arbiter")
                 if arb:
                     sys.stdout.write("  arbiter: %s yields (%s)\n" % (arb["yield"], arb["reason"]))
@@ -1656,10 +1467,8 @@ def cmd_verify(git, argv):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     records = []
     timeout = checker_timeout()
-    rate, salt = surface_rate(), surface_salt()
-    agent_id = os.environ.get("MOIRE_AGENT_ID")     # a label only - see the module note above write_agent_marker
-    if cd:
-        write_agent_marker(cd, top, agent_id)
+    agent_id = os.environ.get("MOIRE_AGENT_ID")     # a provenance label recorded on OUR OWN record only;
+                                                      # never read by any predicate (verdict, arbiter, finding_id)
 
     # Self is ALWAYS recomputed - see cmd_check for why. Publish into the
     # cache too so this worktree is a cache hit when someone else's `moire
@@ -1712,16 +1521,13 @@ def cmd_verify(git, argv):
                 "self": {"worktree": top, "branch": me.get("branch"),
                          "head": me.get("head"), "tree": my_tree, "agent_id": agent_id},
                 "peer": {"worktree": p["worktree"], "branch": p.get("branch"),
-                         "head": phead, "tree": None,
-                         "agent_id": read_agent_marker(cd, p["worktree"]) if cd else None},
+                         "head": phead, "tree": None},
                 "verdict": "error", "conflict_paths": [],
                 "git_version": git.version_str, "oracle": "merge-tree --write-tree",
                 "duration_ms": 0, "error": None, "semantic": None,
                 # see cmd_check for what peer/peer_recomputed each mean
                 "cached": {"self": False, "peer": False, "peer_recomputed": False},
                 "finding_id": None, "arbiter": None,
-                # unaffected by suppression when there is no finding to suppress
-                "surfaced": True, "surface_rate": rate, "surface_salt": salt,
             }
             tmp_dirs = []
 
@@ -1884,7 +1690,6 @@ def cmd_verify(git, argv):
                 fid = compute_finding_id(top, p["worktree"], _finding_tokens(rec))
                 rec["finding_id"] = fid
                 if fid:
-                    rec["surfaced"] = is_surfaced(fid, rate, salt)
                     rec["arbiter"] = compute_arbiter(git, top, self_info, peer_info,
                                                      my_tree, my_commit, ptree, pcommit)
             except Exception as ex:
@@ -1899,10 +1704,6 @@ def cmd_verify(git, argv):
     finally:
         if self_state["dir"]:
             shutil.rmtree(self_state["dir"], ignore_errors=True)
-
-    # Notes are read ONLY here, strictly after every verdict above is final -
-    # same non-negotiable as cmd_check.
-    decorate_with_notes(records, cd)
 
     # one log shard file per invocation - never a shared append - same layout as check
     if cd:
@@ -1940,7 +1741,6 @@ def cmd_verify(git, argv):
                              "only the peer has (%s)\n" % (name, count, shown))
 
     if as_json:
-        # tooling output, not agent-facing: includes suppressed findings too
         sys.stdout.write(json.dumps(records, indent=2) + "\n")
     else:
         if not records:
@@ -1948,8 +1748,6 @@ def cmd_verify(git, argv):
         for r in records:
             peer = r["peer"]["worktree"]
             if r["verdict"] == "conflict":
-                if not r.get("surfaced", True):
-                    continue           # suppressed: logged above in full, but the agent sees nothing
                 sem = r.get("semantic")
                 sys.stdout.write("CONFLICT with %s (%s) [finding %s]\n" %
                                  (peer, r["peer"]["branch"] or "detached", r.get("finding_id")))
@@ -1967,8 +1765,6 @@ def cmd_verify(git, argv):
                         % mcov.get("total", 0))
                 for pth in r["conflict_paths"]:
                     sys.stdout.write("    %s\n" % pth)
-                for note in r.get("peer_notes") or []:
-                    sys.stdout.write("    peer (%s): %s\n" % (note.get("source","agent"), note["text"]))
                 arb = r.get("arbiter")
                 if arb:
                     sys.stdout.write("  arbiter: %s yields (%s)\n" % (arb["yield"], arb["reason"]))
@@ -1988,8 +1784,6 @@ def cmd_verify(git, argv):
                 sem = r["semantic"] or {}
                 new = sem.get("new_breakage") or []
                 if new:
-                    if not r.get("surfaced", True):
-                        continue       # suppressed: logged above in full, but the agent sees nothing
                     sys.stdout.write("BROKEN  with %s (%d new breakage(s), merged tree %s) [finding %s]\n" %
                                      (peer, len(new), sem.get("merged_tree"), r.get("finding_id")))
                     for item in new:
@@ -1997,8 +1791,6 @@ def cmd_verify(git, argv):
                         # an external checker's finding is one raw string line.
                         sys.stdout.write("    %s\n" %
                                          (tuple(item) if isinstance(item, list) else item,))
-                    for note in r.get("peer_notes") or []:
-                        sys.stdout.write("    peer (%s): %s\n" % (note.get("source","agent"), note["text"]))
                     arb = r.get("arbiter")
                     if arb:
                         sys.stdout.write("  arbiter: %s yields (%s)\n" % (arb["yield"], arb["reason"]))
@@ -2042,85 +1834,6 @@ def cmd_verify(git, argv):
                              sem.get("merged_broken", 0)))
             _linked_union_lines(r.get("semantic"))
     return 0                          # warn-only: always 0
-
-
-def cmd_explain(git, argv):
-    """`moire explain <finding_id> <text...>` - file a human/agent note against a
-    finding, for display ONLY. Writes a note file; does not touch, read, or
-    require a verdict. The note becomes visible to the PEER the next time it
-    runs `check`/`verify` and gets the same finding_id from the other side -
-    see decorate_with_notes(), which runs after that peer's verdict is final.
-    """
-    usage = ("moire: usage: moire explain <finding_id> <text...|-> [--source task|agent|human]\n"
-             "    --source task   text came from a pre-existing task/ticket/prompt (no LLM call)\n"
-             "    --source agent  the agent's own post-hoc account (a self-report)\n"
-             "    --source human  written by a person\n"
-             "    text of '-' reads from stdin, so a harness can pipe a ticket verbatim\n")
-    source = "agent"
-    args = []
-    i = 0
-    while i < len(argv):
-        if argv[i] == "--source" and i + 1 < len(argv):
-            source = argv[i + 1]
-            i += 2
-            continue
-        args.append(argv[i])
-        i += 1
-    if source not in ("task", "agent", "human"):
-        sys.stderr.write("moire: --source must be one of task|agent|human\n" + usage)
-        return 2
-    if len(args) < 2:
-        sys.stderr.write(usage)
-        return 2
-    finding_id = args[0]
-    text = " ".join(args[1:]).strip()
-    if text == "-":
-        text = sys.stdin.read().strip()
-    if not text:
-        sys.stderr.write(usage)
-        return 2
-
-    if not _require_git(git):
-        return 2
-
-    cwd = os.getcwd()
-    top = git.out(["rev-parse", "--show-toplevel"], cwd=cwd)
-    if not top:
-        sys.stderr.write("moire: not inside a git worktree\n")
-        return 2
-    top = os.path.realpath(top)
-    cd = common_dir(git, cwd)
-    if not cd:
-        sys.stderr.write("moire: could not resolve git common dir\n")
-        return 2
-
-    wts = list_worktrees(git, cwd)
-    me = None
-    for w in wts:
-        if w["worktree"] == top:
-            me = w
-    branch = me.get("branch") if me else None
-
-    nd = notes_dir(cd)
-    try:
-        os.makedirs(nd)
-    except OSError:
-        pass
-    note = {
-        "v": 1, "finding_id": finding_id,
-        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "worktree": top, "branch": branch,
-        "source": source,
-        "text": _sanitize_note_text(text),
-    }
-    name = "%s-%s-%d.json" % (finding_id, datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f"), os.getpid())
-    path = os.path.join(nd, name)
-    tmp = os.path.join(nd, "." + name + ".tmp")
-    with open(tmp, "w") as f:
-        json.dump(note, f)
-    os.rename(tmp, path)
-    sys.stdout.write("noted: %s\n" % path)
-    return 0
 
 
 def cmd_doctor(git, argv):
@@ -2653,6 +2366,32 @@ def cmd_wire_client(git, argv):
 # a task description - work partitioning is explicitly out of scope for this
 # project (see the README's account of what was tried and thrown away).
 
+def _tree_differs(a, b):
+    """True if two directory trees differ in file set or byte CONTENT - never
+    mtime, which a fresh copy of the source tree always changes even when
+    nothing else did (that would make every re-run of init-swarm think an
+    untouched skill differs and back it up for no reason). filecmp.cmp with
+    shallow=False forces a real content read regardless of os.stat.  Any
+    read/stat error counts as "differs": never skip a backup on doubt.
+    """
+    try:
+        a_rel = set(os.path.relpath(os.path.join(dp, f), a)
+                    for dp, _dn, fn in os.walk(a) for f in fn)
+        b_rel = set(os.path.relpath(os.path.join(dp, f), b)
+                    for dp, _dn, fn in os.walk(b) for f in fn)
+    except OSError:
+        return True
+    if a_rel != b_rel:
+        return True
+    for rel in a_rel:
+        try:
+            if not filecmp.cmp(os.path.join(a, rel), os.path.join(b, rel), shallow=False):
+                return True
+        except OSError:
+            return True
+    return False
+
+
 def _parse_init_swarm_args(argv):
     agents = None
     prefix = "agent"
@@ -2816,9 +2555,15 @@ def cmd_init_swarm(git, argv):
                 d = os.path.join(root, name)
                 if dry_run:
                     step("  [dry-run] would copy %s -> %s" % (src, d))
-                else:
-                    shutil.copytree(src, d, dirs_exist_ok=True)
-                    step("  copied: %s" % d)
+                    continue
+                if os.path.isdir(d) and _tree_differs(src, d):
+                    backup = d + ".moire-backup"
+                    if os.path.isdir(backup):
+                        shutil.rmtree(backup)
+                    shutil.move(d, backup)
+                    step("  backed up differing copy: %s -> %s" % (d, backup))
+                shutil.copytree(src, d, dirs_exist_ok=True)
+                step("  copied: %s" % d)
 
     # 5. Doctor --------------------------------------------------------
     step("== doctor ==")
@@ -2869,21 +2614,13 @@ def _read_log_records(ld):
     return records, checks
 
 
-# --------------------------------------------------------------- study report
+# -------------------------------------------------------------------- report
 #
 # Everything below is derived by re-reading the same log shards `moire report`
 # already reads - no new state file, no counter maintained incrementally by
 # `check`/`verify`. That is deliberate: concurrent writers make
 # read-modify-write racy (graft #10's own lesson, one shard per invocation,
-# generalises to "don't maintain shared mutable summaries either"), and the
-# shards already contain everything a study needs, including - since the
-# `finding_id` fix above - a stable identity for "this collision" that both
-# sides agree on.
-
-STUDY_MIN_N = 20     # refuse a rate below this per arm; a spurious number here
-                      # is worse than none, given this project's history with a
-                      # fabricated statistic. Document, don't just pick, the floor.
-
+# generalises to "don't maintain shared mutable summaries either").
 
 def _pair_key(rec):
     s = (rec.get("self") or {}).get("worktree")
@@ -2954,9 +2691,7 @@ def _semantic_unperformed(rec):
 
 def _semantic_under_conflict_finding(rec):
     """-> True for a verify record whose builtin checker ran UNDER a textual
-    conflict and found breakage on files disjoint from it. One shared
-    predicate so `report` and `report --study` can never disagree on which
-    records this counts."""
+    conflict and found breakage on files disjoint from it."""
     sem = rec.get("semantic")
     return (isinstance(sem, dict) and bool(sem.get("under_conflict"))
             and bool(sem.get("new_breakage")))
@@ -2965,12 +2700,8 @@ def _semantic_under_conflict_finding(rec):
 def _finding_lifecycle(records):
     """-> {finding_id: {...}} - one entry per distinct finding_id seen across
     every record, built purely by grouping/re-scanning; nothing here is
-    accumulated across calls or persisted.
-
-    Shared by `report` (which uses first/last/times_seen/live/kind) and
-    `report --study` (which additionally reads the arm and agent fields).
-    Deriving both from one function is what makes it impossible for the two
-    commands to disagree about how many distinct findings a log contains.
+    accumulated across calls or persisted. Used by `report`'s findings
+    section (first/last/times_seen/live/kind).
     """
     finding_records = {}
     pair_records = {}
@@ -2997,154 +2728,15 @@ def _finding_lifecycle(records):
         latest_pair_rec = latest_by_pair.get(_pair_key(last_rec))
         live = bool(latest_pair_rec is not None and latest_pair_rec.get("finding_id") == fid)
 
-        self_agent = (last_rec.get("self") or {}).get("agent_id")
-        peer_agent = (last_rec.get("peer") or {}).get("agent_id")
-        if self_agent is None or peer_agent is None:
-            agent_bucket = "unknown"
-        elif self_agent == peer_agent:
-            agent_bucket = "same_agent"
-        else:
-            agent_bucket = "cross_agent"
-
         meta[fid] = {
             "finding_id": fid,
             "first_seen": first_rec.get("ts"),
             "last_seen": last_rec.get("ts"),
             "times_seen": len(rs),
-            "distinct_checks": len(set(r.get("check_id") for r in rs)),
             "live": live,
-            # deterministic on finding_id+salt (see is_surfaced) so this should
-            # never actually disagree across records/sides for one finding_id,
-            # unless MOIRE_SURFACE_RATE/SALT changed mid-study - if it did, go with
-            # whatever the most recent observation saw.
-            "surfaced": bool(last_rec.get("surfaced", True)),
-            "agent_bucket": agent_bucket,
             "kind": _finding_kind(last_rec),
         }
     return meta
-
-
-def _median(values):
-    if not values:
-        return None
-    s = sorted(values)
-    n = len(s)
-    mid = n // 2
-    if n % 2:
-        return float(s[mid])
-    return (s[mid - 1] + s[mid]) / 2.0
-
-
-def _arm_summary(fids, meta):
-    """-> stats for one arm/bucket of finding_ids. Count is always reported;
-    the derived rates (median times_seen as a persistence proxy, share that
-    stopped recurring) are withheld below STUDY_MIN_N in favour of an
-    explicit "insufficient data" message - see the module note above.
-    """
-    n = len(fids)
-    if n < STUDY_MIN_N:
-        return {"n": n, "insufficient_data":
-                "insufficient data (n=%d, need >=%d)" % (n, STUDY_MIN_N)}
-    times = [meta[f]["times_seen"] for f in fids]
-    stopped = sum(1 for f in fids if not meta[f]["live"])
-    return {
-        "n": n,
-        "median_times_seen": _median(times),
-        "share_stopped_recurring": stopped / float(n),
-    }
-
-
-def _report_study(records, as_json):
-    meta = _finding_lifecycle(records)
-    fids = list(meta.keys())
-
-    lifecycle = [meta[f] for f in
-                 sorted(fids, key=lambda f: meta[f]["times_seen"], reverse=True)][:20]
-
-    surfaced_fids = [f for f in fids if meta[f]["surfaced"]]
-    suppressed_fids = [f for f in fids if not meta[f]["surfaced"]]
-    cross_fids = [f for f in fids if meta[f]["agent_bucket"] == "cross_agent"]
-    same_fids = [f for f in fids if meta[f]["agent_bucket"] == "same_agent"]
-    unknown_fids = [f for f in fids if meta[f]["agent_bucket"] == "unknown"]
-    textual_fids = [f for f in fids if meta[f]["kind"] == "textual"]
-    semantic_fids = [f for f in fids if meta[f]["kind"] == "semantic"]
-
-    study = {
-        "distinct_findings": len(fids),
-        "min_n_per_arm": STUDY_MIN_N,
-        "lifecycle_top20_by_times_seen": lifecycle,
-        "arms": {
-            "surfaced": _arm_summary(surfaced_fids, meta),
-            "suppressed": _arm_summary(suppressed_fids, meta),
-            "caveat": "observational, not causal: surfaced vs suppressed is a random split of "
-                      "which findings were SHOWN, not a controlled trial of an intervention on "
-                      "agent behaviour - a difference here is a hypothesis, not a conclusion.",
-        },
-        "agent_split": {
-            "cross_agent": _arm_summary(cross_fids, meta),
-            "same_agent": _arm_summary(same_fids, meta),
-            "unknown": _arm_summary(unknown_fids, meta),
-        },
-        "kind_split": {
-            "textual": _arm_summary(textual_fids, meta),
-            "semantic": _arm_summary(semantic_fids, meta),
-        },
-        # Records whose semantic pass never ran because the merge conflicted
-        # textually - without this, kind_split silently under-reports the
-        # semantic dimension (a skipped check is not a clean one).
-        "skipped_semantic_checks": sum(1 for r in records if _semantic_skipped(r)),
-        # Records whose checker ran but could read nothing. Distinct from
-        # skipped (a textual conflict pre-empted the pass) and from clean:
-        # nothing was measured, so they belong in no rate at all.
-        "unperformed_semantic_checks": sum(1 for r in records if _semantic_unperformed(r)),
-        # Builtin-checker breakage found UNDER a textual conflict, on files
-        # disjoint from it. Same predicate as `report`, so the two commands
-        # count the same records; excluded from any rate (not clean merges).
-        "semantic_findings_under_conflict": sum(
-            1 for r in records if _semantic_under_conflict_finding(r)),
-    }
-
-    if as_json:
-        sys.stdout.write(json.dumps(study, indent=2) + "\n")
-        return 0
-
-    sys.stdout.write("distinct findings           : %d\n" % study["distinct_findings"])
-    sys.stdout.write("\nlifecycle (top 20 by times_seen):\n")
-    if not lifecycle:
-        sys.stdout.write("  (none)\n")
-    for m in lifecycle:
-        sys.stdout.write("  %s  seen=%-4d checks=%-3d first=%s last=%s live=%s\n" % (
-            m["finding_id"], m["times_seen"], m["distinct_checks"],
-            m["first_seen"], m["last_seen"], m["live"]))
-
-    def _print_arm(label, summary):
-        if "insufficient_data" in summary:
-            sys.stdout.write("  %-12s: %s\n" % (label, summary["insufficient_data"]))
-        else:
-            sys.stdout.write("  %-12s: n=%-4d median_times_seen=%-6.1f stopped_recurring=%.1f%%\n" % (
-                label, summary["n"], summary["median_times_seen"],
-                100.0 * summary["share_stopped_recurring"]))
-
-    sys.stdout.write("\narm comparison - surfaced vs suppressed (OBSERVATIONAL, NOT CAUSAL):\n")
-    _print_arm("surfaced", study["arms"]["surfaced"])
-    _print_arm("suppressed", study["arms"]["suppressed"])
-
-    sys.stdout.write("\ncross-agent vs same-agent (agent_id is a label; never affects verdicts):\n")
-    _print_arm("cross-agent", study["agent_split"]["cross_agent"])
-    _print_arm("same-agent", study["agent_split"]["same_agent"])
-    _print_arm("unknown", study["agent_split"]["unknown"])
-
-    sys.stdout.write("\ntextual vs semantic:\n")
-    _print_arm("textual", study["kind_split"]["textual"])
-    _print_arm("semantic", study["kind_split"]["semantic"])
-    sys.stdout.write("  skipped semantic checks (textual conflict pre-empted the pass): %d\n" %
-                     study["skipped_semantic_checks"])
-    sys.stdout.write("  semantic findings under conflict (disjoint breakage; not in any rate): %d\n" %
-                     study["semantic_findings_under_conflict"])
-    sys.stdout.write("  semantic checks not performed (checker could read nothing; not in any rate): %d\n" %
-                     study["unperformed_semantic_checks"])
-
-    return 0
 
 
 def cmd_report(git, argv):
@@ -3158,9 +2750,16 @@ def cmd_report(git, argv):
     literally contains and hiding them would make the derivation
     unauditable; but nothing is a rate over them.
     """
-    opts, _pos = _parse_argv("report", argv, bool_flags=("--json", "--study"))
+    if "--study" in argv:
+        # A named refusal, not the generic "unknown argument" one: --study
+        # used to be a real command surface (the suppression-arm study, now
+        # deleted - see D1) and a caller who still types it deserves to be
+        # told why, not just that the flag is unrecognised. Checked and
+        # refused BEFORE _parse_argv/log access, same as every other refusal.
+        _refuse("report", "unknown argument '--study' for report "
+                "(removed in 0.11; see report's findings section)")
+    opts, _pos = _parse_argv("report", argv, bool_flags=("--json",))
     as_json = opts["--json"]
-    study = opts["--study"]
     cwd = os.getcwd()
     cd = common_dir(git, cwd) if git.path else None
     if not cd:
@@ -3168,9 +2767,6 @@ def cmd_report(git, argv):
         return 2
     ld = log_dir(cd)
     all_records, checks = _read_log_records(ld)
-
-    if study:
-        return _report_study(all_records, as_json)
 
     # Older records carry no pair-state that can be trusted the same way (the
     # finding_id they hold was computed path-only, and their rates were
@@ -3331,7 +2927,6 @@ moire - observed-diff conflict detection between concurrent git worktrees
                                     node_modules) from each worktree into its materialised
                                     tree so external checkers can resolve dependencies
                                     without either flag, reads the git config keys below
-  moire explain <finding_id> <text...> file a display-only note against a finding id (never gates a verdict)
   moire doctor                         verify git version, hooks, install, state dir
   moire install [--print-client-hooks] install git hooks into $GIT_COMMON_DIR/hooks/
   moire init-swarm --agents N [--prefix agent] [--skills user|project|none] [--dry-run]
@@ -3345,16 +2940,10 @@ moire - observed-diff conflict detection between concurrent git worktrees
                                     before writing, writes atomically, keeps a backup.
   moire report [--json]                rates over distinct pair-states, distinct findings, and
                                     contested paths, from the log
-  moire report --study [--json]        lifecycle, surfaced-vs-suppressed, cross/same-agent and
-                                    textual-vs-semantic splits over accumulated log shards
 
 Env vars:
-  MOIRE_SURFACE_RATE   float, default 1.0 - fraction of findings actually shown to the agent
-                    (the rest are still logged in full; deterministic per finding_id)
-  MOIRE_SURFACE_SALT   string, default "" - change to re-randomise the surfaced/suppressed
-                    split for a new study window
-  MOIRE_AGENT_ID       string, default unset - a label recorded alongside each check/verify
-                    record for cross-agent vs same-agent analysis; never affects a verdict
+  MOIRE_AGENT_ID       string, default unset - a provenance label recorded on your own
+                    check/verify records; never read by any predicate
 
 Git config keys (read by `verify`; `.git/config` is never cloned, so a checkout
 cannot carry a command, and one setting covers every worktree of the repo):
@@ -3385,8 +2974,6 @@ def main(argv):
         return cmd_check(git, rest)
     if cmd == "verify":
         return cmd_verify(git, rest)
-    if cmd == "explain":
-        return cmd_explain(git, rest)
     if cmd == "doctor":
         return cmd_doctor(git, rest)
     if cmd == "install":
