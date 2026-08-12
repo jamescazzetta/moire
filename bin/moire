@@ -345,17 +345,41 @@ def snapshot_peer_cached(git, wt, cd, head):
     another agent's own `moire check` treating this worktree as a peer) gets a
     hit too.
     """
-    idx_mtime, idx_size = _index_fingerprint(git, wt)
     cached = read_snapshot_cache(cd, wt) if cd else None
-    if (cached and cached.get("worktree") == wt and cached.get("tree") and cached.get("commit")
-            and cached.get("head") == head
-            and cached.get("index_mtime") == idx_mtime and cached.get("index_size") == idx_size
-            and (time.time() - float(cached.get("cached_at", 0))) <= cache_ttl()):
-        return cached["tree"], cached["commit"], True
+    if cached:
+        idx_mtime, idx_size = _index_fingerprint(git, wt)
+        if (cached.get("worktree") == wt and cached.get("tree") and cached.get("commit")
+                and cached.get("head") == head
+                and cached.get("index_mtime") == idx_mtime and cached.get("index_size") == idx_size
+                and (time.time() - float(cached.get("cached_at", 0))) <= cache_ttl()):
+            return cached["tree"], cached["commit"], True
+    tree, commit = snapshot_peer_fresh(git, wt, cd, head)
+    return tree, commit, False
+
+
+def snapshot_peer_fresh(git, wt, cd, head):
+    """Snapshot a PEER worktree unconditionally and republish the cache entry.
+
+    -> (tree, commit). This is the recompute-on-finding path: a CONFLICT or a
+    BROKEN computed against a cached peer snapshot is re-derived here against
+    the peer's state right now, before it is emitted. The cache's staleness
+    window (<= MOIRE_CACHE_TTL) is harmless for a clean verdict - it
+    self-corrects on the next check and nobody acts on "clean" - but a stale
+    FINDING is the one mode where moire is confidently wrong in the direction
+    of a warning: the peer reverts its edit, and self keeps printing a
+    collision that no longer exists for as long as the TTL lasts. The cost of
+    the extra snapshot lands only on the rare finding path.
+
+    The index fingerprint is read BEFORE the snapshot, exactly as
+    snapshot_peer_cached does: a fingerprint taken afterwards could match an
+    index the snapshot did not actually see, turning a later cache hit into a
+    silently stale one.
+    """
+    idx_mtime, idx_size = _index_fingerprint(git, wt)
     tree, commit = snapshot(git, wt)
     if cd:
         write_snapshot_cache(cd, wt, tree, commit, head, idx_mtime, idx_size)
-    return tree, commit, False
+    return tree, commit
 
 
 def oracle(git, cwd, commit_a, commit_b):
@@ -696,13 +720,26 @@ def run_checker(checker, directory, timeout):
 # on: a note attached today must still be findable against the same collision
 # tomorrow.
 
-def _finding_paths(rec):
-    """-> sorted contested paths for a check/verify record, or [] if there is
-    nothing to name: a textual conflict names its own conflict_paths; a
+def _finding_tokens(rec):
+    """-> the sorted identity tokens for a check/verify record's finding, or []
+    if there is nothing to name.
+
+    A textual conflict names its own conflict_paths. A
     textual-clean-but-semantically-broken merge (verify only) names the
-    new_breakage entries instead (their first tuple element for the builtin
-    checker's (path, module, name) triples, the raw line for an external
-    checker). Clean-and-unbroken records get [].
+    new_breakage entries instead - ONE TOKEN PER BREAKAGE, the whole finding:
+    the builtin checker's (path, module, name) triple joined with \\x1f, an
+    external checker's raw line as-is. Clean-and-unbroken records get [].
+
+    This used to keep only the PATH of each breakage (item[0]), which
+    collapsed every distinct breakage in one file into a single identity:
+    two different names going missing in the same file were one finding, and
+    fixing one of them while the other persisted looked like the same
+    unchanged finding. Distinct-finding counts (the kill-gate metric) were
+    the direct casualty.
+
+    Tokens must already be in the MERGED namespace when a rename
+    canonicalisation runs upstream of them - the id names the breakage as the
+    merged tree shows it, not as either parent spelled it.
     """
     paths = rec.get("conflict_paths") or []
     if paths:
@@ -711,15 +748,15 @@ def _finding_paths(rec):
     breakage = sem.get("new_breakage") or []
     out = []
     for item in breakage:
-        if isinstance(item, (list, tuple)) and item:
-            out.append(str(item[0]))
+        if isinstance(item, (list, tuple)):
+            out.append("\x1f".join(str(e) for e in item))
         else:
             out.append(str(item))
     return sorted(out)
 
 
-def compute_finding_id(self_worktree, peer_worktree, paths):
-    """-> 12-hex-char id, or None if `paths` is empty (nothing to identify).
+def compute_finding_id(self_worktree, peer_worktree, tokens):
+    """-> 12-hex-char id, or None if `tokens` is empty (nothing to identify).
 
     MUST be symmetric: the same collision observed from either worktree has
     to yield the identical id, or suppression (each side would roll its own
@@ -728,12 +765,19 @@ def compute_finding_id(self_worktree, peer_worktree, paths):
     finds it) both silently break. Sorting the two worktree paths before
     hashing is what buys that - the pair {A, B} hashes the same regardless of
     which one is "self" for this call.
+
+    Consequence of keying on the full tokens (see _finding_tokens): an
+    EVOLVING collision - one whose contested path set or breakage set grows -
+    is a NEW finding, not the old one seen again. That is the honest reading
+    (the breakage really is different) and `report`'s distinct-finding count
+    may therefore modestly over-count a collision that grew before it was
+    resolved. It is only acceptable because nothing randomises on the id.
     """
-    if not paths:
+    if not tokens:
         return None
     wt_a, wt_b = sorted((self_worktree, peer_worktree))
     h = hashlib.sha1()
-    for part in (wt_a, wt_b, "\x1f".join(sorted(paths))):
+    for part in (wt_a, wt_b, "\x1f\x1f".join(sorted(tokens))):
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
     return h.hexdigest()[:12]
@@ -1051,6 +1095,95 @@ def compute_arbiter(git, top, self_info, peer_info, self_tree, self_commit, peer
 
 
 # ------------------------------------------------------------------- commands
+#
+# One argv parser for every command. A flag moire does not know, or a
+# value-flag with nothing after it, is a REFUSAL (exit 2) - never a silent
+# no-op. The three defects this closes were all silent successes: `check
+# --block` looked like it installed a blocking mode and did nothing at all;
+# `verify --checker` at the end of argv silently ran the builtin checker
+# instead of the one the caller named; `verify --peers` at the end of argv
+# silently fanned out to EVERY worktree instead of the one named. Each of
+# those produced a confident, wrong-shaped answer that no output distinguished
+# from the intended one.
+#
+# The refusal happens before the command body runs, so it is structurally
+# impossible for a bad invocation to snapshot a worktree, touch the cache, or
+# write a log shard. That is the constraint (refuse only on an unusable
+# environment or a bad argument, and only before any state is written), made
+# a property of control flow rather than a rule to remember.
+
+COMMAND_USAGE = {
+    "check": "usage: moire check [--json] [--peers a,b]",
+    "verify": ("usage: moire verify [--json] [--peers a,b] [--checker <cmd>] "
+               "[--link <name>]..."),
+    "report": "usage: moire report [--json] [--study]",
+    "doctor": "usage: moire doctor",
+    "install": "usage: moire install [--print-client-hooks]",
+}
+
+
+def _refuse(cmd, problem):
+    """Write `problem` plus `cmd`'s one-line usage to stderr and exit 2.
+
+    Raises rather than returns: a caller cannot forget to propagate it, and
+    no code after the parse call can run on a refused invocation.
+    """
+    sys.stderr.write("moire: %s\n" % problem)
+    sys.stderr.write("%s\n" % COMMAND_USAGE.get(cmd, "usage: moire %s" % cmd))
+    raise SystemExit(2)
+
+
+def _parse_argv(cmd, argv, value_flags=(), bool_flags=(), repeat_flags=(), positional=(0, 0)):
+    """-> (opts, positionals), or exits 2 via _refuse().
+
+    value_flags   flags taking one value; missing, or followed by something
+                  that looks like another flag, refuses.
+    bool_flags    presence flags.
+    repeat_flags  value flags collected into a list, in argv order.
+    positional    (min, max) count of bare arguments.
+
+    opts is keyed by the flag spelling itself ("--json"), so a reader of the
+    command body sees exactly the string a user types. Booleans default to
+    False, value flags to None, repeat flags to [].
+    """
+    opts = {}
+    for f in bool_flags:
+        opts[f] = False
+    for f in value_flags:
+        opts[f] = None
+    for f in repeat_flags:
+        opts[f] = []
+    pos = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            sys.stdout.write("%s\n" % COMMAND_USAGE.get(cmd, "usage: moire %s" % cmd))
+            raise SystemExit(0)
+        if a in bool_flags:
+            opts[a] = True
+            i += 1
+            continue
+        if a in value_flags or a in repeat_flags:
+            if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+                _refuse(cmd, "%s requires a value" % a)
+            if a in repeat_flags:
+                opts[a].append(argv[i + 1])
+            else:
+                opts[a] = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith("-"):
+            _refuse(cmd, "unknown argument %r for %s" % (a, cmd))
+        pos.append(a)
+        i += 1
+    lo, hi = positional
+    if len(pos) > hi:
+        _refuse(cmd, "unexpected argument %r for %s" % (pos[hi], cmd))
+    if len(pos) < lo:
+        _refuse(cmd, "%s needs %d argument(s), got %d" % (cmd, lo, len(pos)))
+    return opts, pos
+
 
 def _require_git(git):
     if git.path is None or git.version < MIN_GIT:
@@ -1065,12 +1198,10 @@ def _require_git(git):
 
 
 def cmd_check(git, argv):
-    as_json = "--json" in argv
-    peers_arg = None
-    if "--peers" in argv:
-        i = argv.index("--peers")
-        if i + 1 < len(argv):
-            peers_arg = argv[i + 1]
+    opts, _pos = _parse_argv("check", argv, bool_flags=("--json",),
+                             value_flags=("--peers",))
+    as_json = opts["--json"]
+    peers_arg = opts["--peers"]
     if peers_arg is None:
         peers_arg = os.environ.get("MOIRE_PEERS")
 
@@ -1138,7 +1269,7 @@ def cmd_check(git, argv):
         self_info = {"worktree": top, "branch": me.get("branch"), "head": me.get("head")}
         peer_info = {"worktree": p["worktree"], "branch": p.get("branch"), "head": phead}
         rec = {
-            "v": 1, "check_id": check_id, "ts": ts, "repo_common_dir": cd,
+            "v": 2, "check_id": check_id, "ts": ts, "repo_common_dir": cd,
             "self": {"worktree": top, "branch": me.get("branch"),
                      "head": me.get("head"), "tree": my_tree, "agent_id": agent_id},
             "peer": {"worktree": p["worktree"], "branch": p.get("branch"),
@@ -1147,7 +1278,10 @@ def cmd_check(git, argv):
             "verdict": "error", "conflict_paths": [],
             "git_version": git.version_str, "oracle": "merge-tree --write-tree",
             "duration_ms": 0, "error": None,
-            "cached": {"self": False, "peer": False},
+            # "peer" records that this pass STARTED from a cache hit;
+            # "peer_recomputed" that a finding was then re-derived from a
+            # fresh peer snapshot, so the verdict below is not the cache's.
+            "cached": {"self": False, "peer": False, "peer_recomputed": False},
             "finding_id": None, "arbiter": None,
             # unaffected by suppression when there is no finding to suppress
             "surfaced": True, "surface_rate": rate, "surface_salt": salt,
@@ -1162,12 +1296,18 @@ def cmd_check(git, argv):
             else:
                 ptree, pcommit = snapshot(git, p["worktree"])
                 peer_cached = False
-            rec["peer"]["tree"] = ptree
             rec["cached"]["peer"] = peer_cached
             verdict, paths = oracle(git, top, my_commit, pcommit)
+            if verdict == "conflict" and peer_cached:
+                # Never emit a finding a peer may already have withdrawn -
+                # see snapshot_peer_fresh.
+                ptree, pcommit = snapshot_peer_fresh(git, p["worktree"], cd, phead)
+                rec["cached"]["peer_recomputed"] = True
+                verdict, paths = oracle(git, top, my_commit, pcommit)
+            rec["peer"]["tree"] = ptree
             rec["verdict"] = verdict
             rec["conflict_paths"] = paths
-            fid = compute_finding_id(top, p["worktree"], _finding_paths(rec))
+            fid = compute_finding_id(top, p["worktree"], _finding_tokens(rec))
             rec["finding_id"] = fid
             if fid:
                 rec["surfaced"] = is_surfaced(fid, rate, salt)
@@ -1239,27 +1379,16 @@ def cmd_verify(git, argv):
     agent's own problem, not a collision this pair created. Warn-only, like
     check: always exits 0.
     """
-    as_json = "--json" in argv
-    peers_arg = None
-    checker = None                    # resolved below: flag > git config > builtin-ast
+    opts, _pos = _parse_argv("verify", argv, bool_flags=("--json",),
+                             value_flags=("--peers", "--checker"),
+                             repeat_flags=("--link",))
+    as_json = opts["--json"]
+    peers_arg = opts["--peers"]
+    checker = opts["--checker"]       # resolved below: flag > git config > builtin-ast
     checker_source = None
-    if "--peers" in argv:
-        i = argv.index("--peers")
-        if i + 1 < len(argv):
-            peers_arg = argv[i + 1]
     if peers_arg is None:
         peers_arg = os.environ.get("MOIRE_PEERS")
-    if "--checker" in argv:
-        i = argv.index("--checker")
-        if i + 1 < len(argv):
-            checker = argv[i + 1]
-    links = []                        # repeatable: every --link <name> occurrence
-    for i, a in enumerate(argv):
-        if a == "--link":
-            if i + 1 >= len(argv):
-                sys.stderr.write("moire: --link requires a directory name\n")
-                return 2              # refuse; write no log
-            links.append(argv[i + 1])
+    links = list(opts["--link"])      # repeatable: every --link <name> occurrence
     for name in links:
         if not _valid_link_name(name):
             sys.stderr.write("moire: --link %r: name must be a single path component "
@@ -1385,7 +1514,7 @@ def cmd_verify(git, argv):
             self_info = {"worktree": top, "branch": me.get("branch"), "head": me.get("head")}
             peer_info = {"worktree": p["worktree"], "branch": p.get("branch"), "head": phead}
             rec = {
-                "v": 1, "check_id": check_id, "ts": ts, "repo_common_dir": cd,
+                "v": 2, "check_id": check_id, "ts": ts, "repo_common_dir": cd,
                 "self": {"worktree": top, "branch": me.get("branch"),
                          "head": me.get("head"), "tree": my_tree, "agent_id": agent_id},
                 "peer": {"worktree": p["worktree"], "branch": p.get("branch"),
@@ -1394,12 +1523,124 @@ def cmd_verify(git, argv):
                 "verdict": "error", "conflict_paths": [],
                 "git_version": git.version_str, "oracle": "merge-tree --write-tree",
                 "duration_ms": 0, "error": None, "semantic": None,
-                "cached": {"self": False, "peer": False},
+                # see cmd_check for what peer/peer_recomputed each mean
+                "cached": {"self": False, "peer": False, "peer_recomputed": False},
                 "finding_id": None, "arbiter": None,
                 # unaffected by suppression when there is no finding to suppress
                 "surfaced": True, "surface_rate": rate, "surface_salt": salt,
             }
             tmp_dirs = []
+
+            def _evaluate(ptree, pcommit):
+                """One complete evaluation of this peer snapshot: the textual
+                oracle, then the semantic pass when it applies. -> (verdict,
+                paths, semantic dict or None).
+
+                A function, not straight-line code, because it may have to run
+                TWICE: a finding derived from a cached peer snapshot is
+                re-derived against a fresh one before it is emitted (F7). Both
+                passes append their materialised directories to `tmp_dirs`,
+                which the caller's finally clears.
+                """
+                verdict, paths, merged_tree = oracle_tree(git, top, my_commit, pcommit)
+                if not (verdict == "clean" or (verdict == "conflict" and checker == "builtin-ast")):
+                    # Under a textual conflict, merge-tree still writes a merged
+                    # tree - conflicting paths carry baked-in conflict markers. Only
+                    # builtin-ast is safe on such a tree: a marker-laden .py is
+                    # unparsable, so the checker withholds judgement for it and its
+                    # importers (zero false positives by construction). An external
+                    # checker would emit a syntax-error cascade whose diagnostics
+                    # land in importers - paths NOT in conflict_paths - so for an
+                    # external checker the semantic pass stays skipped (None).
+                    return verdict, paths, None
+                # Self is materialised and checked ONCE per verify (memoised):
+                # the first peer to need it pays the full cost, recorded as
+                # self_duration_ms; peers reusing the memo record 0. duration_ms
+                # below is therefore MARGINAL per peer and comparable across
+                # peers - it never absorbs the shared self pass.
+                paid_self = self_state["broken"] is None
+                t_self = time.time()
+                self_broken = _self_checked()
+                self_ms = int((time.time() - t_self) * 1000) if paid_self else 0
+                t1 = time.time()
+                peer_dir = tempfile.mkdtemp(prefix="moire-verify-peer-")
+                merged_dir = tempfile.mkdtemp(prefix="moire-verify-merged-")
+                tmp_dirs.extend([peer_dir, merged_dir])
+                materialize_tree(git, top, ptree, peer_dir)
+                materialize_tree(git, top, merged_tree, merged_dir)
+                # sources per tree: self <- self's worktree, peer <- the
+                # peer's worktree, merged <- self's worktree (a deliberate
+                # approximation - see link_directories).
+                peer_linked = link_directories(peer_dir, p["worktree"], links)
+                merged_linked = link_directories(merged_dir, top, links)
+                peer_broken, peer_cov = run_checker(checker, peer_dir, timeout)
+                merged_broken, merged_cov = run_checker(checker, merged_dir, timeout)
+                new_breakage = merged_broken - self_broken - peer_broken
+                excluded = 0
+                if verdict == "conflict":
+                    # Breakage ON a conflicting path is the textual conflict
+                    # restated, not an extra semantic finding - drop it. What
+                    # survives is breakage on files entirely disjoint from the
+                    # conflict, which the old all-or-nothing gate never saw.
+                    cp = set(paths)
+                    kept = set()
+                    for x in new_breakage:
+                        first = x[0] if isinstance(x, (tuple, list)) and x else x
+                        if str(first) in cp:
+                            excluded += 1
+                        else:
+                            kept.add(x)
+                    new_breakage = kept
+                # builtin-ast findings are (path, module, name) tuples -> lists;
+                # an external checker's are whole stdout lines (strings), which
+                # list() would explode into characters. Types are homogeneous
+                # within one record (one checker per run), so the type-aware
+                # sort key is safe.
+                nb = [list(x) if isinstance(x, tuple) else x for x in new_breakage]
+                nb.sort(key=lambda x: [str(e) for e in x] if isinstance(x, list) else [x])
+                # The builtin checker reports how much of the tree it could
+                # read; an external checker has no channel to (coverage is
+                # None) and its applicability is the user's explicit choice.
+                # `performed` keys on the MERGED tree only - that is the tree
+                # the top-level claim is about. A peer adding the repo's
+                # first .py file gives self coverage 0 / merged coverage 1,
+                # and self_broken == 0 is then genuinely true (no imports
+                # exist to break), so the set difference stays exact.
+                performed = (merged_cov is None) or (merged_cov["examined"] > 0)
+                sem = {
+                    "checker": checker,
+                    "checker_source": checker_source,
+                    # Stored, not derived at read time: this is the
+                    # load-bearing bit for the Phase 1 base rate, and
+                    # `report` must not be able to misderive it.
+                    "performed": performed,
+                    "coverage": None if merged_cov is None else {
+                        "self": self_state["coverage"],
+                        "peer": peer_cov,
+                        "merged": merged_cov,
+                    },
+                    "merged_tree": merged_tree,
+                    "new_breakage": nb,
+                    "self_broken": len(self_broken),
+                    "peer_broken": len(peer_broken),
+                    "merged_broken": len(merged_broken),
+                    "duration_ms": int((time.time() - t1) * 1000),
+                    "self_duration_ms": self_ms,
+                    # Per tree, not a union: an asymmetry (e.g. peer tree got
+                    # no link because the peer worktree lacks the directory,
+                    # while merged borrowed self's) is exactly what explains
+                    # a checker's output failing to cancel - a union hides it.
+                    "linked": {"self": sorted(self_state["linked"]),
+                               "peer": sorted(peer_linked),
+                               "merged": sorted(merged_linked)},
+                }
+                if verdict == "conflict":
+                    # Omitted entirely on the clean path so existing records
+                    # stay comparable.
+                    sem["under_conflict"] = True
+                    sem["excluded_conflict_paths"] = excluded
+                return verdict, paths, sem
+
             try:
                 if my_err:
                     raise RuntimeError("self snapshot failed: %s" % my_err)
@@ -1410,107 +1651,21 @@ def cmd_verify(git, argv):
                 else:
                     ptree, pcommit = snapshot(git, p["worktree"])
                     peer_cached = False
-                rec["peer"]["tree"] = ptree
                 rec["cached"]["peer"] = peer_cached
-                verdict, paths, merged_tree = oracle_tree(git, top, my_commit, pcommit)
+                verdict, paths, sem = _evaluate(ptree, pcommit)
+                if peer_cached and (verdict == "conflict" or (sem and sem.get("new_breakage"))):
+                    # Never emit a finding a peer may already have withdrawn -
+                    # see snapshot_peer_fresh. The whole pass repeats, semantic
+                    # side included: the merged tree itself changes when the
+                    # peer's does.
+                    ptree, pcommit = snapshot_peer_fresh(git, p["worktree"], cd, phead)
+                    rec["cached"]["peer_recomputed"] = True
+                    verdict, paths, sem = _evaluate(ptree, pcommit)
+                rec["peer"]["tree"] = ptree
                 rec["verdict"] = verdict
                 rec["conflict_paths"] = paths
-                if verdict == "clean" or (verdict == "conflict" and checker == "builtin-ast"):
-                    # Under a textual conflict, merge-tree still writes a merged
-                    # tree - conflicting paths carry baked-in conflict markers. Only
-                    # builtin-ast is safe on such a tree: a marker-laden .py is
-                    # unparsable, so the checker withholds judgement for it and its
-                    # importers (zero false positives by construction). An external
-                    # checker would emit a syntax-error cascade whose diagnostics
-                    # land in importers - paths NOT in conflict_paths - so for an
-                    # external checker the semantic pass stays skipped (None).
-                    # Self is materialised and checked ONCE per verify (memoised):
-                    # the first peer to need it pays the full cost, recorded as
-                    # self_duration_ms; peers reusing the memo record 0. duration_ms
-                    # below is therefore MARGINAL per peer and comparable across
-                    # peers - it never absorbs the shared self pass.
-                    paid_self = self_state["broken"] is None
-                    t_self = time.time()
-                    self_broken = _self_checked()
-                    self_ms = int((time.time() - t_self) * 1000) if paid_self else 0
-                    t1 = time.time()
-                    peer_dir = tempfile.mkdtemp(prefix="moire-verify-peer-")
-                    merged_dir = tempfile.mkdtemp(prefix="moire-verify-merged-")
-                    tmp_dirs = [peer_dir, merged_dir]
-                    materialize_tree(git, top, ptree, peer_dir)
-                    materialize_tree(git, top, merged_tree, merged_dir)
-                    # sources per tree: self <- self's worktree, peer <- the
-                    # peer's worktree, merged <- self's worktree (a deliberate
-                    # approximation - see link_directories).
-                    peer_linked = link_directories(peer_dir, p["worktree"], links)
-                    merged_linked = link_directories(merged_dir, top, links)
-                    peer_broken, peer_cov = run_checker(checker, peer_dir, timeout)
-                    merged_broken, merged_cov = run_checker(checker, merged_dir, timeout)
-                    new_breakage = merged_broken - self_broken - peer_broken
-                    excluded = 0
-                    if verdict == "conflict":
-                        # Breakage ON a conflicting path is the textual conflict
-                        # restated, not an extra semantic finding - drop it. What
-                        # survives is breakage on files entirely disjoint from the
-                        # conflict, which the old all-or-nothing gate never saw.
-                        cp = set(paths)
-                        kept = set()
-                        for x in new_breakage:
-                            first = x[0] if isinstance(x, (tuple, list)) and x else x
-                            if str(first) in cp:
-                                excluded += 1
-                            else:
-                                kept.add(x)
-                        new_breakage = kept
-                    # builtin-ast findings are (path, module, name) tuples -> lists;
-                    # an external checker's are whole stdout lines (strings), which
-                    # list() would explode into characters. Types are homogeneous
-                    # within one record (one checker per run), so the type-aware
-                    # sort key is safe.
-                    nb = [list(x) if isinstance(x, tuple) else x for x in new_breakage]
-                    nb.sort(key=lambda x: [str(e) for e in x] if isinstance(x, list) else [x])
-                    # The builtin checker reports how much of the tree it could
-                    # read; an external checker has no channel to (coverage is
-                    # None) and its applicability is the user's explicit choice.
-                    # `performed` keys on the MERGED tree only - that is the tree
-                    # the top-level claim is about. A peer adding the repo's
-                    # first .py file gives self coverage 0 / merged coverage 1,
-                    # and self_broken == 0 is then genuinely true (no imports
-                    # exist to break), so the set difference stays exact.
-                    performed = (merged_cov is None) or (merged_cov["examined"] > 0)
-                    rec["semantic"] = {
-                        "checker": checker,
-                        "checker_source": checker_source,
-                        # Stored, not derived at read time: this is the
-                        # load-bearing bit for the Phase 1 base rate, and
-                        # `report` must not be able to misderive it.
-                        "performed": performed,
-                        "coverage": None if merged_cov is None else {
-                            "self": self_state["coverage"],
-                            "peer": peer_cov,
-                            "merged": merged_cov,
-                        },
-                        "merged_tree": merged_tree,
-                        "new_breakage": nb,
-                        "self_broken": len(self_broken),
-                        "peer_broken": len(peer_broken),
-                        "merged_broken": len(merged_broken),
-                        "duration_ms": int((time.time() - t1) * 1000),
-                        "self_duration_ms": self_ms,
-                        # Per tree, not a union: an asymmetry (e.g. peer tree got
-                        # no link because the peer worktree lacks the directory,
-                        # while merged borrowed self's) is exactly what explains
-                        # a checker's output failing to cancel - a union hides it.
-                        "linked": {"self": sorted(self_state["linked"]),
-                                   "peer": sorted(peer_linked),
-                                   "merged": sorted(merged_linked)},
-                    }
-                    if verdict == "conflict":
-                        # Omitted entirely on the clean path so existing records
-                        # stay comparable.
-                        rec["semantic"]["under_conflict"] = True
-                        rec["semantic"]["excluded_conflict_paths"] = excluded
-                fid = compute_finding_id(top, p["worktree"], _finding_paths(rec))
+                rec["semantic"] = sem
+                fid = compute_finding_id(top, p["worktree"], _finding_tokens(rec))
                 rec["finding_id"] = fid
                 if fid:
                     rec["surfaced"] = is_surfaced(fid, rate, salt)
@@ -1731,6 +1886,7 @@ def cmd_explain(git, argv):
 
 
 def cmd_doctor(git, argv):
+    _parse_argv("doctor", argv)
     cwd = os.getcwd()
     healthy = [True]
 
@@ -1945,6 +2101,7 @@ export default { "tool.execute.after": async () => {
 
 
 def cmd_install(git, argv):
+    opts, _pos = _parse_argv("install", argv, bool_flags=("--print-client-hooks",))
     cwd = os.getcwd()
     if not _require_git(git):
         return 2
@@ -1954,7 +2111,7 @@ def cmd_install(git, argv):
         return 2
 
     dest = installed_bin(cd)
-    if "--print-client-hooks" in argv:
+    if opts["--print-client-hooks"]:
         sys.stdout.write(CLIENT_HOOKS % {"bin": dest})
         return 0
 
@@ -2498,6 +2655,32 @@ def _pair_key(rec):
     return tuple(sorted((s, p)))
 
 
+RECORD_VERSION = 2
+
+
+def _pair_state_key(rec):
+    """-> the observed CONTENT state of a worktree pair: a sorted (self_tree,
+    peer_tree) pair of snapshot tree OIDs, or None when either is missing.
+
+    This, not the record, is what a rate must be computed over. A hook that
+    fires on every write re-observes an unchanged pair dozens of times; every
+    one of those observations is a record, and counting records made a single
+    collision seen four times read as "4 pairs, 4 breakages, rate 1.0". Tree
+    OIDs are content-addressed, so two observations collapse into one
+    pair-state exactly when nothing either side owns has changed - which is
+    the definition of "the same situation", and the only denominator the
+    project's kill criterion can be honestly stated over.
+
+    What it is NOT: a task, a merge, a session, or a day. Two agents that
+    edit, revert, and re-edit the same file produce three pair-states.
+    """
+    st = (rec.get("self") or {}).get("tree")
+    pt = (rec.get("peer") or {}).get("tree")
+    if not st or not pt:
+        return None
+    return tuple(sorted((st, pt)))
+
+
 def _finding_kind(rec):
     """-> 'textual' | 'semantic' for a record that carries a finding_id.
     Textual: verdict == 'conflict' (check or verify, `conflict_paths` is
@@ -2505,7 +2688,7 @@ def _finding_kind(rec):
     (`semantic.new_breakage` under a clean verdict). A conflict record may
     now ALSO carry `semantic.new_breakage` - the builtin checker runs under
     a textual conflict for breakage on files disjoint from it - and is still
-    classified 'textual', because `_finding_paths` keys the finding on
+    classified 'textual', because `_finding_tokens` keys the finding on
     `conflict_paths`; that extra dimension is surfaced separately as
     `semantic_findings_under_conflict` in `report`.
     """
@@ -2541,10 +2724,15 @@ def _semantic_under_conflict_finding(rec):
             and bool(sem.get("new_breakage")))
 
 
-def _study_metrics(records):
+def _finding_lifecycle(records):
     """-> {finding_id: {...}} - one entry per distinct finding_id seen across
     every record, built purely by grouping/re-scanning; nothing here is
     accumulated across calls or persisted.
+
+    Shared by `report` (which uses first/last/times_seen/live/kind) and
+    `report --study` (which additionally reads the arm and agent fields).
+    Deriving both from one function is what makes it impossible for the two
+    commands to disagree about how many distinct findings a log contains.
     """
     finding_records = {}
     pair_records = {}
@@ -2629,7 +2817,7 @@ def _arm_summary(fids, meta):
 
 
 def _report_study(records, as_json):
-    meta = _study_metrics(records)
+    meta = _finding_lifecycle(records)
     fids = list(meta.keys())
 
     lifecycle = [meta[f] for f in
@@ -2722,91 +2910,175 @@ def _report_study(records, as_json):
 
 
 def cmd_report(git, argv):
-    as_json = "--json" in argv
-    study = "--study" in argv
+    """Rates over distinct PAIR-STATES, not over observations.
+
+    The distinction is the whole point of this command. Every rate below has
+    as its denominator the number of distinct observed content-states of a
+    worktree pair (see _pair_state_key), and every count of findings is a
+    count of distinct finding_ids. The raw observation counts are still
+    printed - one line, clearly labelled - because they are what the log
+    literally contains and hiding them would make the derivation
+    unauditable; but nothing is a rate over them.
+    """
+    opts, _pos = _parse_argv("report", argv, bool_flags=("--json", "--study"))
+    as_json = opts["--json"]
+    study = opts["--study"]
     cwd = os.getcwd()
     cd = common_dir(git, cwd) if git.path else None
     if not cd:
         sys.stderr.write("moire: not inside a git worktree\n")
         return 2
     ld = log_dir(cd)
-    records, checks = _read_log_records(ld)
+    all_records, checks = _read_log_records(ld)
 
     if study:
-        return _report_study(records, as_json)
+        return _report_study(all_records, as_json)
 
-    pairs = [r for r in records if r.get("verdict") in ("clean", "conflict")]
-    conflicts = [r for r in pairs if r["verdict"] == "conflict"]
+    # Older records carry no pair-state that can be trusted the same way (the
+    # finding_id they hold was computed path-only, and their rates were
+    # per-observation), so they are counted and set aside rather than mixed
+    # in. Retroactive derivation is the rule everywhere else in this tool -
+    # `report` re-derives everything from the raw shards on every call - and
+    # this is the one place it cannot: the shape changed under the records.
+    records = [r for r in all_records if r.get("v") == RECORD_VERSION]
+    pre_v2 = len(all_records) - len(records)
+
+    # --- textual, per pair-state -----------------------------------------
+    evaluated = {}
+    for r in records:
+        if r.get("verdict") not in ("clean", "conflict"):
+            continue
+        k = _pair_state_key(r)
+        if k is None:
+            continue
+        evaluated[k] = evaluated.get(k, False) or (r["verdict"] == "conflict")
+    pair_states = len(evaluated)
+    conflicting_states = sum(1 for v in evaluated.values() if v)
+    textual_rate = (float(conflicting_states) / pair_states) if pair_states else None
+
+    # --- semantic, per pair-state ----------------------------------------
+    # A verify record whose semantic pass actually ran carries a dict; one
+    # pre-empted by a textual conflict is counted as skipped, not clean.
+    # under_conflict records are excluded: they are not clean merges, and the
+    # published kill criterion is about clean merges. A record whose checker
+    # could read nothing (builtin-ast on a tree with no .py files) is
+    # excluded too - it measured nothing, so counting it as a clean semantic
+    # pair-state would bias the rate toward zero on exactly the repos where
+    # nothing was checked. Both are counted separately, never discarded.
+    performed_states = {}
+    for r in records:
+        sem = r.get("semantic")
+        if not isinstance(sem, dict) or sem.get("under_conflict") or not sem.get("performed", True):
+            continue
+        k = _pair_state_key(r)
+        if k is None:
+            continue
+        performed_states[k] = performed_states.get(k, False) or bool(sem.get("new_breakage"))
+    semantic_states = len(performed_states)
+    broken_states = sum(1 for v in performed_states.values() if v)
+    semantic_rate = (float(broken_states) / semantic_states) if semantic_states else None
+
+    # --- distinct findings ------------------------------------------------
+    meta = _finding_lifecycle(records)
+    findings = [meta[f] for f in
+                sorted(meta, key=lambda f: (-meta[f]["times_seen"], f))][:20]
+    findings = [{"finding_id": m["finding_id"], "kind": m["kind"],
+                 "first_seen": m["first_seen"], "last_seen": m["last_seen"],
+                 "times_seen": m["times_seen"], "live": m["live"]}
+                for m in findings]
+    distinct_textual = sum(1 for m in meta.values() if m["kind"] == "textual")
+    distinct_semantic = sum(1 for m in meta.values() if m["kind"] == "semantic")
+
+    # --- raw observations (transparency, never a denominator) -------------
+    obs_pairs = [r for r in records if r.get("verdict") in ("clean", "conflict")]
+    obs_conflicts = [r for r in obs_pairs if r["verdict"] == "conflict"]
+    obs_semantic = [r for r in records
+                    if isinstance(r.get("semantic"), dict)
+                    and not r["semantic"].get("under_conflict")
+                    and r["semantic"].get("performed", True)]
+    obs_breakage = [r for r in obs_semantic if r["semantic"].get("new_breakage")]
     errors = [r for r in records if r.get("verdict") == "error"]
     peers = set(r["peer"]["worktree"] for r in records if r.get("peer"))
-    with_peer = set(r["check_id"] for r in records)
+
     paths = {}
-    for r in conflicts:
+    for r in obs_conflicts:
         for p in r.get("conflict_paths", []):
             paths[p] = paths.get(p, 0) + 1
     top_paths = sorted(paths.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
-    base_rate = (float(len(conflicts)) / len(pairs)) if pairs else None
 
-    # The semantic dimension, measured separately from the textual base_rate
-    # above (whose meaning is unchanged: textual conflicts / textual pairs).
-    # A verify record whose semantic pass actually ran carries a dict; one
-    # pre-empted by a textual conflict is counted as skipped, not clean.
-    # under_conflict records are excluded from the rate: they are not clean
-    # merges, and the published kill criterion is about clean merges. Their
-    # findings are surfaced separately below so nothing is discarded.
-    # A record whose checker could read nothing (builtin-ast on a tree with no
-    # .py files) is excluded too: it measured nothing, so counting it as a
-    # clean semantic pair would bias the rate toward zero on exactly the repos
-    # where nothing was checked. Counted separately, never discarded.
-    semantic_pairs = [r for r in records
-                      if isinstance(r.get("semantic"), dict)
-                      and not r["semantic"].get("under_conflict")
-                      and r["semantic"].get("performed", True)]
-    semantic_breakages = [r for r in semantic_pairs if r["semantic"].get("new_breakage")]
-    semantic_rate = (float(len(semantic_breakages)) / len(semantic_pairs)) if semantic_pairs else None
     under_conflict_findings = [r for r in records if _semantic_under_conflict_finding(r)]
     skipped_semantic = sum(1 for r in records if _semantic_skipped(r))
     unperformed_semantic = sum(1 for r in records if _semantic_unperformed(r))
 
     if as_json:
         sys.stdout.write(json.dumps({
-            "checks": checks, "checks_with_peers": len(with_peer),
-            "peer_pairs_evaluated": len(pairs), "conflicts": len(conflicts),
-            "errors": len(errors), "distinct_peers": len(peers),
-            "base_rate": base_rate, "top_paths": top_paths,
-            "semantic_pairs": len(semantic_pairs),
-            "semantic_breakages": len(semantic_breakages),
+            "checks": checks,
+            "pre_v2_records_ignored": pre_v2,
+            "pair_states_evaluated": pair_states,
+            "conflicting_pair_states": conflicting_states,
+            "textual_rate": textual_rate,
+            "semantic_pair_states_performed": semantic_states,
+            "broken_pair_states": broken_states,
             "semantic_rate": semantic_rate,
+            "distinct_findings": {"textual": distinct_textual,
+                                  "semantic": distinct_semantic},
+            "findings": findings,
+            "top_paths": top_paths,
             "semantic_findings_under_conflict": len(under_conflict_findings),
             "skipped_semantic_checks": skipped_semantic,
             "unperformed_semantic_checks": unperformed_semantic,
+            "distinct_peers": len(peers),
+            "errors": len(errors),
+            # Kept for transparency and for anyone reconciling these numbers
+            # against the shards by hand. Never a denominator - see the
+            # docstring.
+            "observations": {
+                "pair_records": len(obs_pairs),
+                "conflict_records": len(obs_conflicts),
+                "semantic_records": len(obs_semantic),
+                "breakage_records": len(obs_breakage),
+            },
         }, indent=2) + "\n")
         return 0
 
-    sys.stdout.write("checks run                 : %d\n" % checks)
-    sys.stdout.write("checks with >=1 peer       : %d\n" % len(with_peer))
-    sys.stdout.write("distinct peers seen        : %d\n" % len(peers))
-    sys.stdout.write("peer-pairs evaluated       : %d\n" % len(pairs))
-    sys.stdout.write("conflicting pairs          : %d\n" % len(conflicts))
-    sys.stdout.write("errors                     : %d\n" % len(errors))
-    if base_rate is None:
-        sys.stdout.write("base rate (textual)        : n/a (no pairs evaluated)\n")
+    sys.stdout.write("checks run                        : %d\n" % checks)
+    sys.stdout.write("pre-v2 records ignored            : %d%s\n" %
+                     (pre_v2, "  (delete .git/moire/log to reset)" if pre_v2 else ""))
+    sys.stdout.write("pair-states evaluated             : %d    "
+                     "(distinct (self_tree, peer_tree) observations)\n" % pair_states)
+    sys.stdout.write("conflicting pair-states           : %d\n" % conflicting_states)
+    if textual_rate is None:
+        sys.stdout.write("textual rate (per pair-state)     : n/a (no pair-states evaluated)\n")
     else:
-        sys.stdout.write("base rate (textual)        : %.1f%%\n" % (100.0 * base_rate))
-    sys.stdout.write("semantic pairs evaluated   : %d\n" % len(semantic_pairs))
-    sys.stdout.write("semantic breakages         : %d\n" % len(semantic_breakages))
+        sys.stdout.write("textual rate (per pair-state)     : %.1f%%\n" % (100.0 * textual_rate))
+    sys.stdout.write("semantic pair-states (performed)  : %d\n" % semantic_states)
+    sys.stdout.write("broken pair-states                : %d\n" % broken_states)
     if semantic_rate is None:
-        sys.stdout.write("semantic rate (clean merges that break) : n/a (no clean-merge semantic pairs)\n")
+        sys.stdout.write("semantic rate (clean pair-states that break) : "
+                         "n/a (no performed semantic pair-states)\n")
     else:
-        sys.stdout.write("semantic rate (clean merges that break) : %.1f%%\n" % (100.0 * semantic_rate))
-    sys.stdout.write("semantic findings under conflict        : %d\n" % len(under_conflict_findings))
-    sys.stdout.write("skipped semantic checks    : %d\n" % skipped_semantic)
-    sys.stdout.write("semantic checks not performed (checker examined 0 files) : %d\n"
-                     % unperformed_semantic)
+        sys.stdout.write("semantic rate (clean pair-states that break) : %.1f%%   [n=%d]\n"
+                         % (100.0 * semantic_rate, semantic_states))
+    sys.stdout.write("distinct findings                 : %d textual, %d semantic\n"
+                     % (distinct_textual, distinct_semantic))
+    sys.stdout.write("raw observations                  : %d pair records, %d conflicts, "
+                     "%d semantic, %d breakage\n"
+                     % (len(obs_pairs), len(obs_conflicts), len(obs_semantic), len(obs_breakage)))
+    sys.stdout.write("distinct peers seen               : %d\n" % len(peers))
+    sys.stdout.write("errors                            : %d\n" % len(errors))
+    sys.stdout.write("skipped semantic checks           : %d\n" % skipped_semantic)
+    sys.stdout.write("semantic checks not performed     : %d\n" % unperformed_semantic)
+    sys.stdout.write("semantic findings under conflict  : %d\n" % len(under_conflict_findings))
     if top_paths:
         sys.stdout.write("\ntop contested paths:\n")
         for p, n in top_paths:
             sys.stdout.write("  %4d  %s\n" % (n, p))
+    if findings:
+        sys.stdout.write("\nfindings (top 20 by times seen):\n")
+        for m in findings:
+            sys.stdout.write("  %s  %-8s  seen=%-4d first=%s  last=%s  live=%s\n" % (
+                m["finding_id"], m["kind"], m["times_seen"],
+                m["first_seen"], m["last_seen"], "yes" if m["live"] else "no"))
     return 0
 
 
@@ -2833,7 +3105,8 @@ moire - observed-diff conflict detection between concurrent git worktrees
                                     plan (default) or write (--apply) the client hook that
                                     runs `moire check` after every tool use. Always diffs
                                     before writing, writes atomically, keeps a backup.
-  moire report [--json]                base rate and contested paths from the log
+  moire report [--json]                rates over distinct pair-states, distinct findings, and
+                                    contested paths, from the log
   moire report --study [--json]        lifecycle, surfaced-vs-suppressed, cross/same-agent and
                                     textual-vs-semantic splits over accumulated log shards
 
@@ -2856,7 +3129,9 @@ cannot carry a command, and one setting covers every worktree of the repo):
 
 Warn-only by design: `check` and `verify` never exit nonzero because of a
 finding; they refuse with 2 on an unusable environment or a bad argument,
-before writing any log. Requires git >= 2.38.
+before writing any log. An unknown flag, or a value flag with nothing after
+it, is a bad argument: moire refuses rather than silently ignoring it.
+Requires git >= 2.38.
 """
 
 

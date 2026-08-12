@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# test_verify.sh - Verify `moire verify`'s semantic path (V1-V24)
+# test_verify.sh - Verify `moire verify`'s semantic path (V1-V30)
 #
 # `moire check` is textual only and is covered by tests/test_oracle.sh.
 # `moire verify` additionally materialises self/peer/merged trees and runs a
@@ -19,6 +19,10 @@
 #     read, and such a record staying out of the base rate (V19-V20, V23)
 #   - per-repo checker/link from `git config`, and doctor catching an
 #     inapplicable default checker at setup time (V21-V22, V24)
+#   - `report`'s rates being over distinct pair-states and its finding counts
+#     over distinct finding_ids, never over observations (V25-V28, V30)
+#   - a finding computed from a cached peer snapshot being re-derived against
+#     the peer's current state before it is emitted (V29)
 #
 # Exit 0 only if all cases pass; else exit 1 with failure count.
 
@@ -1231,29 +1235,29 @@ test_v15_report_semantic_fields() {
     fi
 
     local has_pairs has_breakages has_rate has_skipped
-    has_pairs=$(json_has "$report_json" "semantic_pairs" 0)
-    has_breakages=$(json_has "$report_json" "semantic_breakages" 0)
+    has_pairs=$(json_has "$report_json" "semantic_pair_states_performed" 0)
+    has_breakages=$(json_has "$report_json" "broken_pair_states" 0)
     has_rate=$(json_has "$report_json" "semantic_rate" 0)
     has_skipped=$(json_has "$report_json" "skipped_semantic_checks" 0)
 
     # This fixture's only record is verdict=="clean" with real semantic
-    # breakage: base_rate (textual conflicts / textual pairs) must be 0.0,
-    # proving it is not inflated by the semantic finding.
+    # breakage: textual_rate (conflicting pair-states / pair-states) must be
+    # 0.0, proving it is not inflated by the semantic finding.
     local summary
     summary=$(python3 -c "
 import json
 d = json.loads('''$report_json''')
-print(d.get('base_rate'), d.get('semantic_breakages'))
+print(d.get('textual_rate'), d.get('broken_pair_states'))
 " 2>/dev/null)
-    local base_rate semantic_breakages
-    read -r base_rate semantic_breakages <<<"$summary"
+    local textual_rate broken_pair_states
+    read -r textual_rate broken_pair_states <<<"$summary"
 
     if [ "$has_pairs" = "yes" ] && [ "$has_breakages" = "yes" ] && [ "$has_rate" = "yes" ] \
-       && [ "$has_skipped" = "yes" ] && [ "${semantic_breakages:-0}" -ge 1 ] && [ "$base_rate" = "0.0" ]; then
+       && [ "$has_skipped" = "yes" ] && [ "${broken_pair_states:-0}" -ge 1 ] && [ "$textual_rate" = "0.0" ]; then
         report_result $num "$name" "PASS"
     else
         report_result $num "$name" "FAIL" \
-            "has_fields(pairs=$has_pairs breakages=$has_breakages rate=$has_rate skipped=$has_skipped) semantic_breakages=$semantic_breakages base_rate=$base_rate"
+            "has_fields(pairs=$has_pairs breakages=$has_breakages rate=$has_rate skipped=$has_skipped) broken_pair_states=$broken_pair_states textual_rate=$textual_rate"
     fi
 }
 
@@ -1670,7 +1674,7 @@ test_v23_report_excludes_unperformed() {
 import json
 d = json.loads('''$ts_report''')
 s = json.loads('''$ts_study''')
-print(d.get('unperformed_semantic_checks'), d.get('semantic_pairs'),
+print(d.get('unperformed_semantic_checks'), d.get('semantic_pair_states_performed'),
       d.get('semantic_rate'), s.get('unperformed_semantic_checks'))
 " 2>/dev/null)
     local unperformed pairs rate study_unperformed
@@ -1678,7 +1682,7 @@ print(d.get('unperformed_semantic_checks'), d.get('semantic_pairs'),
 
     local human_na
     human_na=no
-    echo "$ts_human" | grep -q "semantic rate (clean merges that break) : n/a" && human_na=yes
+    echo "$ts_human" | grep -q "semantic rate (clean pair-states that break) : n/a" && human_na=yes
 
     # A performed record still counts: the exclusion is targeted, not blanket.
     local py_repo="$test_dir/py_repo"
@@ -1694,7 +1698,7 @@ print(d.get('unperformed_semantic_checks'), d.get('semantic_pairs'),
     fi
     local py_report py_pairs
     py_report=$(cd "$py_repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report --json 2>/dev/null)
-    py_pairs=$(json_get "$py_report" "semantic_pairs" 0)
+    py_pairs=$(json_get "$py_report" "semantic_pair_states_performed" 0)
 
     if [ "${unperformed:-0}" -ge 1 ] && [ "${pairs:-1}" -eq 0 ] && [ "$rate" = "None" ] \
        && [ "$human_na" = "yes" ] && [ "${study_unperformed:-0}" -ge 1 ] \
@@ -1702,7 +1706,7 @@ print(d.get('unperformed_semantic_checks'), d.get('semantic_pairs'),
         report_result $num "$name" "PASS"
     else
         report_result $num "$name" "FAIL" \
-            "ts: unperformed=$unperformed semantic_pairs=$pairs semantic_rate=$rate human_na=$human_na study_unperformed=$study_unperformed; python: semantic_pairs=$py_pairs"
+            "ts: unperformed=$unperformed semantic_pair_states=$pairs semantic_rate=$rate human_na=$human_na study_unperformed=$study_unperformed; python: semantic_pair_states=$py_pairs"
     fi
 }
 
@@ -1749,6 +1753,323 @@ test_v24_doctor_checker_applicability() {
     fi
 }
 
+# ---- A4: the metric the kill criterion is defined on. `report`'s rates are
+# ---- over distinct PAIR-STATES (self_tree, peer_tree) and its finding counts
+# ---- over distinct finding_ids - never over observations, of which a hook
+# ---- firing on every write produces arbitrarily many for one collision.
+
+# Run `moire verify --json` from $1 with the peer cache disabled, so a case
+# that deliberately changes a peer's working tree between runs observes the
+# change instead of a cache hit.
+run_verify_uncached() {
+    local repo="$1"
+    shift
+    (cd "$repo" && MOIRE_CACHE_TTL=0 MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" verify --json "$@" 2>/dev/null)
+}
+
+test_v25_report_counts_pair_states_not_observations() {
+    local num=25 name="report-pair-states-not-observations"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    fixture_v2 "$repo" >/dev/null 2>&1
+
+    if ! git_in "$repo" worktree add -q "$test_dir/peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    # One collision, observed five times - exactly what a per-write hook does.
+    local i
+    for i in 1 2 3 4 5; do
+        if ! run_verify_uncached "$repo" >/dev/null; then
+            report_result $num "$name" "SKIP" "moire verify failed on run $i"
+            return
+        fi
+    done
+
+    local rj
+    rj=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report --json 2>/dev/null)
+    local states broken sem_findings raw_records rate
+    states=$(json_get "$rj" "pair_states_evaluated" 0)
+    broken=$(json_get "$rj" "broken_pair_states" 0)
+    sem_findings=$(json_get "$rj" "distinct_findings.semantic" 0)
+    raw_records=$(json_get "$rj" "observations.pair_records" 0)
+    rate=$(json_get "$rj" "semantic_rate" 0)
+
+    # 5 observations, 1 pair-state, 1 distinct finding. The raw count is still
+    # reported - it is what the log contains - but no rate is over it.
+    if [ "$states" = "1" ] && [ "$broken" = "1" ] && [ "$sem_findings" = "1" ] \
+       && [ "$raw_records" = "5" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "pair_states=$states broken=$broken distinct_semantic=$sem_findings raw_pair_records=$raw_records semantic_rate=$rate"
+    fi
+}
+
+test_v26_report_distinguishes_pair_states() {
+    local num=26 name="report-second-pair-state-moves-the-rate"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    fixture_v2 "$repo" >/dev/null 2>&1
+
+    local peer="$test_dir/peer"
+    if ! git_in "$repo" worktree add -q "$peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    local i
+    for i in 1 2 3; do
+        if ! run_verify_uncached "$repo" >/dev/null; then
+            report_result $num "$name" "SKIP" "moire verify failed on run $i"
+            return
+        fi
+    done
+
+    # The peer withdraws the collision in its working tree: same worktree
+    # pair, genuinely different observed content - a SECOND pair-state, and
+    # this one is not broken.
+    printf 'from lib import new_name\nnew_name()\n' > "$peer/peer_caller.py"
+    if ! run_verify_uncached "$repo" >/dev/null; then
+        report_result $num "$name" "SKIP" "moire verify failed after the peer's fix"
+        return
+    fi
+
+    local rj
+    rj=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report --json 2>/dev/null)
+    local states broken rate raw_records raw_breakage
+    states=$(json_get "$rj" "semantic_pair_states_performed" 0)
+    broken=$(json_get "$rj" "broken_pair_states" 0)
+    rate=$(json_get "$rj" "semantic_rate" 0)
+    raw_records=$(json_get "$rj" "observations.semantic_records" 0)
+    raw_breakage=$(json_get "$rj" "observations.breakage_records" 0)
+
+    # 4 observations, 3 of them of the broken state: an observation rate would
+    # say 75%. The pair-state rate is 1 of 2.
+    if [ "$states" = "2" ] && [ "$broken" = "1" ] && [ "$rate" = "0.5" ] \
+       && [ "$raw_records" = "4" ] && [ "$raw_breakage" = "3" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "pair_states=$states broken=$broken rate=$rate raw_semantic=$raw_records raw_breakage=$raw_breakage"
+    fi
+}
+
+test_v27_finding_id_distinguishes_breakages_in_one_file() {
+    local num=27 name="finding-id-distinct-per-breakage-not-per-path"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    # fixture_v2 with TWO names in the base library, both of which self's
+    # rename removes: the peer can then import either one and produce a
+    # breakage that exists in the merged tree and in neither parent - the
+    # only shape in which two distinct breakages can share one path.
+    init_repo "$repo"
+    printf 'def old_name():\n    return 1\n\n\ndef other_name():\n    return 2\n' > "$repo/lib.py"
+    printf 'from lib import old_name\nold_name()\n' > "$repo/main.py"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm base >/dev/null 2>&1
+    local base; base=$(git_in "$repo" rev-parse HEAD)
+    git_in "$repo" checkout -q -b branch_a >/dev/null 2>&1
+    printf 'def new_name():\n    return 1\n' > "$repo/lib.py"
+    printf 'from lib import new_name\nnew_name()\n' > "$repo/main.py"
+    git_in "$repo" commit -qam "self: rename both names away" >/dev/null 2>&1
+    git_in "$repo" checkout -q "$base" >/dev/null 2>&1
+    git_in "$repo" checkout -q -b branch_b >/dev/null 2>&1
+    printf 'from lib import old_name\nold_name()\n' > "$repo/peer_caller.py"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm "peer: add caller of old_name" >/dev/null 2>&1
+    git_in "$repo" checkout -q branch_a >/dev/null 2>&1
+
+    local peer="$test_dir/peer"
+    if ! git_in "$repo" worktree add -q "$peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    local json1 fid1
+    json1=$(run_verify_uncached "$repo")
+    fid1=$(json_get "$json1" "finding_id" 0)
+
+    # Same file, same worktree pair, DIFFERENT missing name. Keying the id on
+    # the contested path alone made these one finding; they are two.
+    printf 'from lib import other_name\nother_name()\n' > "$peer/peer_caller.py"
+    local json2 fid2
+    json2=$(run_verify_uncached "$repo")
+    fid2=$(json_get "$json2" "finding_id" 0)
+
+    local nb1 nb2
+    nb1=$(python3 -c "
+import json
+print(json.loads('''$json1''')[0]['semantic']['new_breakage'])" 2>/dev/null)
+    nb2=$(python3 -c "
+import json
+print(json.loads('''$json2''')[0]['semantic']['new_breakage'])" 2>/dev/null)
+
+    local rj distinct
+    rj=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report --json 2>/dev/null)
+    distinct=$(json_get "$rj" "distinct_findings.semantic" 0)
+
+    if [ -n "$fid1" ] && [ -n "$fid2" ] && [ "$fid1" != "$fid2" ] && [ "$distinct" = "2" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "fid1=$fid1 ($nb1) fid2=$fid2 ($nb2) distinct_semantic=$distinct"
+    fi
+}
+
+test_v28_semantic_finding_id_symmetric() {
+    local num=28 name="semantic-finding-id-same-from-either-side"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    fixture_v2 "$repo" >/dev/null 2>&1
+
+    local peer="$test_dir/peer"
+    if ! git_in "$repo" worktree add -q "$peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    local fid_self fid_peer
+    fid_self=$(json_get "$(run_verify_uncached "$repo")" "finding_id" 0)
+    fid_peer=$(json_get "$(run_verify_uncached "$peer")" "finding_id" 0)
+
+    if [ -n "$fid_self" ] && [ "$fid_self" = "$fid_peer" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" "self=$fid_self peer=$fid_peer"
+    fi
+}
+
+test_v30_pre_v2_records_ignored_not_fatal() {
+    local num=30 name="pre-v2-records-counted-and-set-aside"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    fixture_v2 "$repo" >/dev/null 2>&1
+
+    if ! git_in "$repo" worktree add -q "$test_dir/peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+    if ! run_verify_uncached "$repo" >/dev/null; then
+        report_result $num "$name" "SKIP" "moire verify failed"
+        return
+    fi
+
+    # Rewrite the shard as a record of the shape 0.10.0 wrote: same fields,
+    # "v": 1, and a finding_id computed the old path-only way. `report` must
+    # count it as ignored rather than mixing an incomparable record into a
+    # rate - and must not crash on it.
+    python3 - "$repo/.git/moire/log" <<'PY'
+import glob, json, os, sys
+for p in sorted(glob.glob(os.path.join(sys.argv[1], "*.json"))):
+    with open(p) as f:
+        arr = json.load(f)
+    for r in arr:
+        r["v"] = 1
+    with open(p, "w") as f:
+        json.dump(arr, f)
+PY
+
+    local rj rc human
+    rj=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report --json 2>/dev/null)
+    rc=$?
+    human=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report 2>/dev/null)
+
+    local ignored states sem_findings
+    ignored=$(json_get "$rj" "pre_v2_records_ignored" 0)
+    states=$(json_get "$rj" "pair_states_evaluated" 0)
+    sem_findings=$(json_get "$rj" "distinct_findings.semantic" 0)
+
+    local human_names_it=no
+    echo "$human" | grep -q "pre-v2 records ignored            : 1" && human_names_it=yes
+
+    if [ "$rc" -eq 0 ] && [ "$ignored" = "1" ] && [ "$states" = "0" ] \
+       && [ "$sem_findings" = "0" ] && [ "$human_names_it" = "yes" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "exit=$rc ignored=$ignored pair_states=$states distinct_semantic=$sem_findings human_line=$human_names_it"
+    fi
+}
+
+# ---- A5: a finding computed from a cached peer snapshot is re-derived
+# ---- against the peer's state right now before it is emitted. Stale-clean is
+# ---- accepted (bounded by the TTL, self-correcting); stale-FINDING is not -
+# ---- it is the one mode where moire is confidently wrong in the direction of
+# ---- a warning.
+
+test_v29_cached_finding_recomputed() {
+    local num=29 name="cached-finding-recomputed-before-emit"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    init_repo "$repo"
+    printf 'line1\n' > "$repo/shared.txt"
+    git_in "$repo" add -A
+    git_in "$repo" commit -qm base >/dev/null 2>&1
+    local base; base=$(git_in "$repo" rev-parse HEAD)
+    git_in "$repo" checkout -q -b branch_a >/dev/null 2>&1
+    printf 'line1 self\n' > "$repo/shared.txt"
+    git_in "$repo" commit -qam "self edits shared.txt" >/dev/null 2>&1
+    git_in "$repo" checkout -q "$base" >/dev/null 2>&1
+    git_in "$repo" checkout -q -b branch_b >/dev/null 2>&1
+    git_in "$repo" checkout -q branch_a >/dev/null 2>&1
+
+    local peer="$test_dir/peer"
+    if ! git_in "$repo" worktree add -q "$peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    # The peer's collision is UNCOMMITTED: it touches neither HEAD nor the
+    # index, which is exactly the state the snapshot cache cannot see change.
+    printf 'line1 peer\n' > "$peer/shared.txt"
+
+    local run_check
+    run_check() {
+        (cd "$repo" && MOIRE_CACHE_TTL=60 MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" check --json 2>/dev/null)
+    }
+
+    local j1 v1
+    j1=$(run_check); v1=$(json_get "$j1" "verdict" 0)
+    local j2 v2 cached2 recomputed2
+    j2=$(run_check)
+    v2=$(json_get "$j2" "verdict" 0)
+    cached2=$(json_bool "$j2" "cached.peer" 0)
+    recomputed2=$(json_bool "$j2" "cached.peer_recomputed" 0)
+
+    # The peer withdraws its edit in the working tree only. HEAD and the index
+    # are untouched, so the cache entry still looks valid and within TTL.
+    printf 'line1\n' > "$peer/shared.txt"
+
+    local j3 v3 cached3 recomputed3
+    j3=$(run_check)
+    v3=$(json_get "$j3" "verdict" 0)
+    cached3=$(json_bool "$j3" "cached.peer" 0)
+    recomputed3=$(json_bool "$j3" "cached.peer_recomputed" 0)
+
+    if [ "$v1" = "conflict" ] && [ "$v2" = "conflict" ] && [ "$cached2" = "true" ] \
+       && [ "$recomputed2" = "true" ] && [ "$v3" = "clean" ] && [ "$cached3" = "true" ] \
+       && [ "$recomputed3" = "true" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "first=$v1; second=$v2 (cached=$cached2 recomputed=$recomputed2); after peer reverted=$v3 (cached=$cached3 recomputed=$recomputed3)"
+    fi
+}
+
 # === MAIN ===
 
 main() {
@@ -1792,6 +2113,12 @@ main() {
     test_v22_git_config_link_and_invalid_link_refused
     test_v23_report_excludes_unperformed
     test_v24_doctor_checker_applicability
+    test_v25_report_counts_pair_states_not_observations
+    test_v26_report_distinguishes_pair_states
+    test_v27_finding_id_distinguishes_breakages_in_one_file
+    test_v28_semantic_finding_id_symmetric
+    test_v30_pre_v2_records_ignored_not_fatal
+    test_v29_cached_finding_recomputed
 
     # Print summary
     local total=$((PASSED + FAILED + SKIPPED))

@@ -938,8 +938,80 @@ test_020() {
 }
 
 
+# An argument moire does not understand is a refusal, not a silent success.
+# Each of these three used to "work": `check --block` looked like it turned on
+# a blocking mode that does not exist and never will; `--checker` at the end
+# of argv silently ran the DEFAULT checker instead of the named one; `--peers`
+# at the end of argv silently fanned out to every worktree instead of the one
+# named. All three produced a confident answer of the wrong shape. The refusal
+# must also land before any state is written - no log shard, ever.
+test_021() {
+	local tmpdir=$(setup_test_repo)
+	TEMP_DIRS+=("$tmpdir")
+	cd "$tmpdir"
+
+	"$MOIRE_BIN" install > /dev/null 2>&1
+	local common_dir
+	common_dir=$(get_git_common_dir)
+	local log_dir="$common_dir/moire/log"
+
+	# A legitimate run first, so "no new shard" is a real comparison rather
+	# than a comparison against a directory that never existed.
+	"$MOIRE_BIN" check > /dev/null 2>&1 || true
+	local before
+	before=$(find "$log_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
+
+	local failures=""
+	check_refusal() {
+		local label=$1 expect=$2
+		shift 2
+		local out rc=0
+		out=$("$MOIRE_BIN" "$@" 2>&1 >/dev/null) || rc=$?
+		local after
+		after=$(find "$log_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
+		if [[ $rc -ne 2 ]]; then
+			failures="$failures [$label: exit $rc, expected 2]"
+		elif ! echo "$out" | grep -qF -- "$expect"; then
+			failures="$failures [$label: stderr lacks '$expect': $out]"
+		elif [[ "$after" != "$before" ]]; then
+			failures="$failures [$label: wrote a log shard ($before -> $after)]"
+		fi
+	}
+
+	check_refusal "check --block" "unknown argument '--block' for check" check --block
+	check_refusal "check --peers (no value)" "--peers requires a value" check --peers
+	check_refusal "verify --checker (no value)" "--checker requires a value" verify --checker
+	check_refusal "verify --checker --json" "--checker requires a value" verify --checker --json
+	check_refusal "verify --link (no value)" "--link requires a value" verify --link
+	check_refusal "report --bogus" "unknown argument '--bogus' for report" report --bogus
+	check_refusal "check extra positional" "unexpected argument 'peer' for check" check peer
+
+	# A usage line accompanies the problem, so the refusal is actionable.
+	local usage_out rc_u=0
+	usage_out=$("$MOIRE_BIN" check --block 2>&1 >/dev/null) || rc_u=$?
+	if ! echo "$usage_out" | grep -q "usage: moire check"; then
+		failures="$failures [no usage line after a refusal]"
+	fi
+
+	# And the valid invocations still work.
+	local rc_ok=0
+	"$MOIRE_BIN" check --json > /dev/null 2>&1 || rc_ok=$?
+	if [[ $rc_ok -ne 0 ]]; then
+		failures="$failures [check --json exited $rc_ok]"
+	fi
+
+	if [[ -z "$failures" ]]; then
+		log_test 021 PASS "unknown and valueless flags refuse with 2, before any log write"
+	else
+		log_test 021 FAIL "$failures"
+	fi
+
+	rm -rf "$tmpdir"
+}
+
 test_019
 test_020
+test_021
 
 # ============================================================================
 # Summary
