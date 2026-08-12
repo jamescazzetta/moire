@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# test_verify.sh - Verify `moire verify`'s semantic path (V1-V36)
+# test_verify.sh - Verify `moire verify`'s semantic path (V1-V42)
 #
 # `moire check` is textual only and is covered by tests/test_oracle.sh.
 # `moire verify` additionally materialises self/peer/merged trees and runs a
@@ -27,6 +27,12 @@
 #     self's own pre-existing breakage (V31-V33) and a peer-installed entry
 #     missing from the merged tree's borrowed directory (V34-V35)
 #   - names bound by top-level compound statements (V36)
+#   - `moire replay`: the same mechanism on two commits rather than two live
+#     worktrees, agreeing with `verify` on the same pair (V37), leaving no
+#     state behind (V38), working in the bare clone a corpus run uses (V39),
+#     applying the pre-registered rename control (V40), naming a finding
+#     independently of argument order (V41), and refusing bad arguments
+#     before doing anything (V42)
 #
 # Exit 0 only if all cases pass; else exit 1 with failure count.
 
@@ -2492,6 +2498,278 @@ print('yes' if s['new_breakage'] == [] else 'no', s['merged_broken'], s['peer_br
     fi
 }
 
+# ---- A7: `moire replay` - the same mechanism on two commits instead of two
+# ---- live worktrees. This is the corpus instrument, so the property that
+# ---- matters most is not that it works but that it AGREES: a published
+# ---- method section reading "moire replay over corpus X" is only honest if
+# ---- replay is the shipped mechanism rather than a second implementation
+# ---- that happens to agree today. V37 is that assertion; the rest cover the
+# ---- environment a corpus run actually happens in (a bare clone), the
+# ---- statelessness a measurement instrument owes the thing it measures, and
+# ---- the pre-registered rename contamination control being live inside it.
+
+# Run `moire replay A B --json` from $1 with extra args, dropping stderr.
+run_replay_json() {
+    local repo="$1" a="$2" b="$3"
+    shift 3
+    (cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" replay "$a" "$b" --json "$@" 2>/dev/null)
+}
+
+test_v37_replay_agrees_with_verify() {
+    local num=37 name="replay-and-verify-agree-on-the-same-pair"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    # The canonical case: disjoint file sets, textually clean, semantically
+    # broken. Both worktrees are clean at their branch heads, so verify's
+    # snapshot of each has the same TREE as the corresponding commit - which
+    # is precisely why the two paths must produce the same merged tree and
+    # the same finding. If they ever diverge here, the corpus number stops
+    # being a statement about `moire verify`.
+    fixture_v2 "$repo" >/dev/null 2>&1
+
+    if ! git_in "$repo" worktree add -q "$test_dir/peer" branch_b >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not add peer worktree"
+        return
+    fi
+
+    local vjson rjson
+    vjson=$(run_verify_json "$repo")
+    if [ $? -ne 0 ] || [ -z "$vjson" ]; then
+        report_result $num "$name" "FAIL" "moire verify produced no JSON"
+        return
+    fi
+    rjson=$(run_replay_json "$repo" branch_a branch_b)
+    if [ $? -ne 0 ] || [ -z "$rjson" ]; then
+        report_result $num "$name" "FAIL" "moire replay produced no JSON"
+        return
+    fi
+
+    local summary
+    summary=$(python3 -c "
+import json
+v = json.loads('''$vjson''')[0]
+r = json.loads('''$rjson''')
+vs, rs = v.get('semantic') or {}, r.get('semantic') or {}
+agree_verdict = v['verdict'] == r['verdict']
+agree_break = vs.get('new_breakage') == rs.get('new_breakage')
+agree_tree = vs.get('merged_tree') == rs.get('merged_tree')
+# The finding must be real, not a shared empty result agreeing vacuously.
+nonvacuous = bool(rs.get('new_breakage'))
+print('yes' if agree_verdict else 'no',
+      'yes' if agree_break else 'no',
+      'yes' if agree_tree else 'no',
+      'yes' if nonvacuous else 'no',
+      r.get('mode'))
+" 2>/dev/null)
+    local a_verdict a_break a_tree nonvacuous mode
+    read -r a_verdict a_break a_tree nonvacuous mode <<<"$summary"
+
+    if [ "$a_verdict" = "yes" ] && [ "$a_break" = "yes" ] && [ "$a_tree" = "yes" ] \
+       && [ "$nonvacuous" = "yes" ] && [ "$mode" = "replay" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "verdict=$a_verdict breakage=$a_break merged_tree=$a_tree nonvacuous=$nonvacuous mode=$mode"
+    fi
+}
+
+test_v38_replay_writes_no_state() {
+    local num=38 name="replay-writes-no-log-cache-or-snapshot"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    fixture_v2 "$repo" >/dev/null 2>&1
+
+    # A measurement instrument that logs contaminates the log it would later
+    # be read against, and `replay` is pointed at repositories that belong to
+    # somebody else. Nothing under .git/moire may appear, and HEAD, the index
+    # and the ref set must be exactly what they were.
+    local head_before refs_before status_before
+    head_before=$(git_in "$repo" rev-parse HEAD)
+    refs_before=$(git_in "$repo" for-each-ref --format='%(refname) %(objectname)' | sort)
+    status_before=$(git_in "$repo" status --porcelain)
+
+    run_replay_json "$repo" branch_a branch_b >/dev/null
+
+    local head_after refs_after status_after state_exists
+    head_after=$(git_in "$repo" rev-parse HEAD)
+    refs_after=$(git_in "$repo" for-each-ref --format='%(refname) %(objectname)' | sort)
+    status_after=$(git_in "$repo" status --porcelain)
+    state_exists=no
+    if [ -e "$repo/.git/moire" ]; then
+        state_exists=yes
+    fi
+
+    if [ "$state_exists" = "no" ] && [ "$head_before" = "$head_after" ] \
+       && [ "$refs_before" = "$refs_after" ] && [ "$status_before" = "$status_after" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "state_dir=$state_exists head_changed=$([ "$head_before" = "$head_after" ] && echo no || echo yes) refs_changed=$([ "$refs_before" = "$refs_after" ] && echo no || echo yes)"
+    fi
+}
+
+test_v39_replay_works_in_a_bare_clone() {
+    local num=39 name="replay-works-in-a-bare-clone"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    fixture_v2 "$repo" >/dev/null 2>&1
+
+    # This is not a corner case: `git clone --bare --filter=blob:none` is how
+    # the corpus harness obtains every repository it replays, so a bare clone
+    # is replay's PRIMARY environment. `check` and `verify` gate on
+    # `rev-parse --show-toplevel`, which fails in a bare repo; replay must
+    # gate on the object store instead, or the measurement cannot be run at
+    # all in the place it was designed to run.
+    local bare="$test_dir/bare.git"
+    if ! "$GIT_PROG" clone -q --bare "$repo" "$bare" >/dev/null 2>&1; then
+        report_result $num "$name" "SKIP" "could not create bare clone"
+        return
+    fi
+
+    local rjson rc
+    rjson=$(cd "$bare" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" replay branch_a branch_b --json 2>/dev/null)
+    rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$rjson" ]; then
+        report_result $num "$name" "FAIL" "replay in bare clone exited $rc with no JSON"
+        return
+    fi
+
+    local summary
+    summary=$(python3 -c "
+import json
+r = json.loads('''$rjson''')
+s = r.get('semantic') or {}
+nb = s.get('new_breakage') or []
+path = (nb[0][0] if isinstance(nb[0], list) else nb[0]) if nb else ''
+print(r['verdict'], len(nb), path)
+" 2>/dev/null)
+    local verdict nb_len path
+    read -r verdict nb_len path <<<"$summary"
+
+    if [ "$verdict" = "clean" ] && [ "$nb_len" = "1" ] && [ "$path" = "peer_caller.py" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" "verdict=$verdict new_breakage_len=$nb_len path=$path"
+    fi
+}
+
+test_v40_replay_canonicalises_renames() {
+    local num=40 name="replay-applies-the-rename-contamination-control"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    # Same fixture as V31, which is entirely committed - self's own broken
+    # import in src/y.py, relocated to src/z.py by the peer's `git mv`.
+    # PHASE1-PREREGISTRATION.md names rename canonicalisation as a
+    # contamination control that is "active inside replay"; this is the
+    # assertion behind that sentence. Without it every renamed file in the
+    # corpus manufactures one false collision per pre-existing finding.
+    fixture_rename "$repo" >/dev/null 2>&1
+
+    local rjson rc
+    rjson=$(run_replay_json "$repo" branch_a branch_b)
+    rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$rjson" ]; then
+        report_result $num "$name" "FAIL" "moire replay exited $rc with no JSON"
+        return
+    fi
+
+    local summary
+    summary=$(python3 -c "
+import json
+r = json.loads('''$rjson''')
+s = r.get('semantic') or {}
+ren = (s.get('renames') or {}).get('self') or []
+# merged_broken > 0 proves the breakage really is in the merged tree; an
+# empty new_breakage is only correct because it was relocated, not missed.
+print(r['verdict'], len(s.get('new_breakage') or []), s.get('merged_broken'),
+      s.get('self_broken'), json.dumps(ren, separators=(',', ':')))
+" 2>/dev/null)
+    local verdict nb_len merged_broken self_broken renames
+    read -r verdict nb_len merged_broken self_broken renames <<<"$summary"
+
+    if [ "$verdict" = "clean" ] && [ "$nb_len" = "0" ] && [ "$merged_broken" = "1" ] \
+       && [ "$self_broken" = "1" ] && [ "$renames" = '[["src/y.py","src/z.py"]]' ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "verdict=$verdict new_breakage_len=$nb_len merged_broken=$merged_broken self_broken=$self_broken renames=$renames"
+    fi
+}
+
+test_v41_replay_finding_id_symmetric() {
+    local num=41 name="replay-finding-id-is-order-independent"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    fixture_v2 "$repo" >/dev/null 2>&1
+
+    # The corpus has no "self": which PR of a pair is argument one is an
+    # accident of iteration order. If the id depended on it, the audit would
+    # count one collision as two.
+    local fid_ab fid_ba
+    fid_ab=$(run_replay_json "$repo" branch_a branch_b | python3 -c "
+import json,sys
+print(json.load(sys.stdin).get('finding_id') or '')" 2>/dev/null)
+    fid_ba=$(run_replay_json "$repo" branch_b branch_a | python3 -c "
+import json,sys
+print(json.load(sys.stdin).get('finding_id') or '')" 2>/dev/null)
+
+    if [ -n "$fid_ab" ] && [ "$fid_ab" = "$fid_ba" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" "a,b=$fid_ab b,a=$fid_ba"
+    fi
+}
+
+test_v42_replay_refuses_bad_arguments() {
+    local num=42 name="replay-refuses-bad-arguments-before-doing-anything"
+    local test_dir; test_dir=$(new_case_dir "v$num")
+    trap "rm -rf '$test_dir'" RETURN
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    fixture_v2 "$repo" >/dev/null 2>&1
+
+    # Constraint 1: refusal with exit 2 only for an unusable environment or a
+    # bad argument, and only BEFORE any state is written. A corpus run that
+    # silently replayed the wrong revision - or silently used the default
+    # checker when a tier-2 one was named - would be undetectable afterwards.
+    local rc_arity rc_badrev rc_flag rc_valueless rc_ok
+    (cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" replay branch_a >/dev/null 2>&1)
+    rc_arity=$?
+    (cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" replay branch_a no_such_rev >/dev/null 2>&1)
+    rc_badrev=$?
+    (cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" replay --block branch_a branch_b >/dev/null 2>&1)
+    rc_flag=$?
+    # --checker with nothing after it must not silently fall back to builtin-ast.
+    (cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" replay branch_a branch_b --checker >/dev/null 2>&1)
+    rc_valueless=$?
+    # ...and a finding is still exit 0: replay never blocks.
+    (cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" replay branch_a branch_b >/dev/null 2>&1)
+    rc_ok=$?
+
+    local state_exists=no
+    if [ -e "$repo/.git/moire" ]; then
+        state_exists=yes
+    fi
+
+    if [ "$rc_arity" -eq 2 ] && [ "$rc_badrev" -eq 2 ] && [ "$rc_flag" -eq 2 ] \
+       && [ "$rc_valueless" -eq 2 ] && [ "$rc_ok" -eq 0 ] && [ "$state_exists" = "no" ]; then
+        report_result $num "$name" "PASS"
+    else
+        report_result $num "$name" "FAIL" \
+            "arity=$rc_arity badrev=$rc_badrev unknown_flag=$rc_flag valueless_checker=$rc_valueless finding=$rc_ok state=$state_exists"
+    fi
+}
+
 # === MAIN ===
 
 main() {
@@ -2549,6 +2827,12 @@ main() {
     test_v34_link_union_covers_peer_added_entry
     test_v35_link_union_both_present_prefers_self
     test_v36_toplevel_compound_statements_bind_names
+    test_v37_replay_agrees_with_verify
+    test_v38_replay_writes_no_state
+    test_v39_replay_works_in_a_bare_clone
+    test_v40_replay_canonicalises_renames
+    test_v41_replay_finding_id_symmetric
+    test_v42_replay_refuses_bad_arguments
 
     # Print summary
     local total=$((PASSED + FAILED + SKIPPED))

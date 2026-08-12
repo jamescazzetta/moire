@@ -918,6 +918,72 @@ def _canonicalise_findings(findings, rmap):
     return frozenset(out), n
 
 
+def subtract_breakage(git, cwd, self_tree, peer_tree, merged_tree,
+                      self_broken, peer_broken, merged_broken,
+                      verdict, conflict_paths):
+    """The whole judgement: broken(merged) - broken(self) - broken(peer).
+
+    -> {"new_breakage": sorted list, "excluded": n, "renames": {...} or None,
+    "canonicalised": {...} or None}.
+
+    This is the ONE place the subtraction happens. `verify` calls it on two
+    live worktrees' snapshots and `replay` on two supplied commits, so the
+    corpus measurement and the shipped tool cannot drift apart: a published
+    method section reading "moire replay over corpus X" is only honest if
+    replay is the same mechanism, not a second implementation of it that
+    happened to agree on the day it was written.
+
+    Both parents' findings are respelled into the merged tree's namespace
+    first, or a rename on either side stops them cancelling (see
+    _rename_map). The maps are computed only when the merged tree is broken
+    at all: with nothing to cancel there is nothing to canonicalise, and this
+    is the hot path.
+    """
+    rmap_self, rmap_peer = {}, {}
+    if merged_broken:
+        rmap_self = _rename_map(git, cwd, self_tree, merged_tree)
+        rmap_peer = _rename_map(git, cwd, peer_tree, merged_tree)
+    self_broken_c, n_self_c = _canonicalise_findings(self_broken, rmap_self)
+    peer_broken_c, n_peer_c = _canonicalise_findings(peer_broken, rmap_peer)
+    new_breakage = merged_broken - self_broken_c - peer_broken_c
+    excluded = 0
+    if verdict == "conflict":
+        # Breakage ON a conflicting path is the textual conflict restated,
+        # not an extra semantic finding - drop it. What survives is breakage
+        # on files entirely disjoint from the conflict, which the old
+        # all-or-nothing gate never saw.
+        cp = set(conflict_paths)
+        kept = set()
+        for x in new_breakage:
+            first = x[0] if isinstance(x, (tuple, list)) and x else x
+            if str(first) in cp:
+                excluded += 1
+            else:
+                kept.add(x)
+        new_breakage = kept
+    out = {"new_breakage": _sorted_findings(new_breakage), "excluded": excluded,
+           "renames": None, "canonicalised": None}
+    if rmap_self or rmap_peer:
+        out["renames"] = {"self": [[o, rmap_self[o]] for o in sorted(rmap_self)],
+                          "peer": [[o, rmap_peer[o]] for o in sorted(rmap_peer)]}
+    if n_self_c or n_peer_c:
+        out["canonicalised"] = {"self": n_self_c, "peer": n_peer_c}
+    return out
+
+
+def _sorted_findings(findings):
+    """-> a JSON-ready, deterministically ordered list of findings.
+
+    builtin-ast findings are (path, module, name) tuples -> lists; an external
+    checker's are whole stdout lines (strings), which list() would explode
+    into characters. Types are homogeneous within one record (one checker per
+    run), so the type-aware sort key is safe.
+    """
+    nb = [list(x) if isinstance(x, tuple) else x for x in findings]
+    nb.sort(key=lambda x: [str(e) for e in x] if isinstance(x, list) else [x])
+    return nb
+
+
 # ------------------------------------------------------------------ finding id
 #
 # A stable id for "this collision", independent of WHEN it was observed. Built
@@ -1137,6 +1203,8 @@ COMMAND_USAGE = {
     "check": "usage: moire check [--json] [--peers a,b]",
     "verify": ("usage: moire verify [--json] [--peers a,b] [--checker <cmd>] "
                "[--link <name>]..."),
+    "replay": ("usage: moire replay <rev-a> <rev-b> [--checker <cmd>] "
+               "[--link <name>]... [--json]"),
     "report": "usage: moire report [--json]",
     "doctor": "usage: moire doctor",
     "install": "usage: moire install [--print-client-hooks]",
@@ -1204,6 +1272,51 @@ def _parse_argv(cmd, argv, value_flags=(), bool_flags=(), repeat_flags=(), posit
     if len(pos) < lo:
         _refuse(cmd, "%s needs %d argument(s), got %d" % (cmd, lo, len(pos)))
     return opts, pos
+
+
+def _resolve_checker(git, cwd, flag_value):
+    """-> (checker, source). Precedence: --checker flag > moire.checker > builtin-ast.
+
+    Per-repo execution context comes from `git config`, NOT from a committed
+    file. `.git/config` is never cloned, so a checkout cannot carry a command;
+    and it lives in $GIT_COMMON_DIR, so one `git config moire.checker ...`
+    covers every worktree of the swarm and every agent need only type `moire
+    verify`. Setting it requires local write access to the clone - the same
+    trust level as installing moire's hooks, and the deliberate contrast with
+    the repo-controlled auto-executed code `doctor` warns about for
+    core.hooksPath. `--checker builtin-ast` stays expressible to override a
+    config back to the default.
+    """
+    if flag_value is not None:
+        return flag_value, "flag"
+    cfg = git.out(["config", "--get", "moire.checker"], cwd=cwd)
+    if cfg:
+        return cfg, "config"
+    return "builtin-ast", "default"
+
+
+def _resolve_links(git, cwd, flag_links):
+    """-> (names, error_text). Links are the union of `--link` occurrences and
+    `moire.link` config entries, flag order first, config entries deduped.
+
+    An invalid name from EITHER source is refused identically (error_text
+    non-None, caller writes it and returns 2 before any snapshot or log
+    write): one predicate for both sources so the two can never disagree.
+    """
+    links = list(flag_links)
+    for name in links:
+        if not _valid_link_name(name):
+            return None, ("moire: --link %r: name must be a single path component "
+                          "(no '/', '\\', '.' or '..')\n" % name)
+    rc_l, out_l, _err_l = git(["config", "--get-all", "moire.link"], cwd=cwd)
+    for name in ([ln.strip() for ln in out_l.split("\n") if ln.strip()]
+                 if rc_l == 0 else []):
+        if not _valid_link_name(name):
+            return None, ("moire: git config moire.link %r: name must be a single path "
+                          "component (no '/', '\\', '.' or '..')\n" % name)
+        if name not in links:
+            links.append(name)
+    return links, None
 
 
 def _require_git(git):
@@ -1389,16 +1502,8 @@ def cmd_verify(git, argv):
                              repeat_flags=("--link",))
     as_json = opts["--json"]
     peers_arg = opts["--peers"]
-    checker = opts["--checker"]       # resolved below: flag > git config > builtin-ast
-    checker_source = None
     if peers_arg is None:
         peers_arg = os.environ.get("MOIRE_PEERS")
-    links = list(opts["--link"])      # repeatable: every --link <name> occurrence
-    for name in links:
-        if not _valid_link_name(name):
-            sys.stderr.write("moire: --link %r: name must be a single path component "
-                             "(no '/', '\\', '.' or '..')\n" % name)
-            return 2                  # refuse; write no log
 
     if not _require_git(git):
         return 2                      # refuse; write no log
@@ -1411,34 +1516,14 @@ def cmd_verify(git, argv):
     top = os.path.realpath(top)
     cd = common_dir(git, cwd)
 
-    # Per-repo execution context, from `git config`, NOT from a committed file.
-    # `.git/config` is never cloned, so a checkout cannot carry a command; and
-    # it lives in $GIT_COMMON_DIR, so one `git config moire.checker ...` covers
-    # every worktree of the swarm and every agent need only type `moire
-    # verify`. Setting it requires local write access to the clone - the same
-    # trust level as installing moire's hooks, and the deliberate contrast with
-    # the repo-controlled auto-executed code `doctor` warns about for
-    # core.hooksPath. Precedence: --checker flag > moire.checker > builtin-ast;
-    # `--checker builtin-ast` stays expressible to override a config back to
-    # the default. Links are the union of flag occurrences and config entries,
-    # flag order first, deduped.
-    if checker is not None:
-        checker_source = "flag"
-    else:
-        cfg = git.out(["config", "--get", "moire.checker"], cwd=cwd)
-        if cfg:
-            checker, checker_source = cfg, "config"
-        else:
-            checker, checker_source = "builtin-ast", "default"
-    rc_l, out_l, _err_l = git(["config", "--get-all", "moire.link"], cwd=cwd)
-    for name in ([ln.strip() for ln in out_l.split("\n") if ln.strip()]
-                 if rc_l == 0 else []):
-        if not _valid_link_name(name):
-            sys.stderr.write("moire: git config moire.link %r: name must be a single path "
-                             "component (no '/', '\\', '.' or '..')\n" % name)
-            return 2                  # refuse; write no log - same shape as the flag refusal
-        if name not in links:
-            links.append(name)
+    # Both resolutions are shared verbatim with `replay` - see _resolve_checker
+    # and _resolve_links - so the corpus instrument reads the same per-repo
+    # configuration the live tool does.
+    checker, checker_source = _resolve_checker(git, cwd, opts["--checker"])
+    links, link_err = _resolve_links(git, cwd, opts["--link"])
+    if link_err:
+        sys.stderr.write(link_err)
+        return 2                      # refuse; write no log
 
     wts = list_worktrees(git, cwd)
     me = None
@@ -1575,40 +1660,14 @@ def cmd_verify(git, argv):
                 merged_linked = link_directories_union(merged_dir, top, p["worktree"], links)
                 peer_broken, peer_cov = run_checker(checker, peer_dir, timeout)
                 merged_broken, merged_cov = run_checker(checker, merged_dir, timeout)
-                # Both parents' findings are respelled into the merged tree's
-                # namespace before the subtraction, or a rename on either side
-                # stops them cancelling (see _rename_map). Computed only when
-                # the merged tree is broken at all: with nothing to cancel
-                # there is nothing to canonicalise, and this is the hot path.
-                rmap_self, rmap_peer = {}, {}
-                if merged_broken:
-                    rmap_self = _rename_map(git, top, my_tree, merged_tree)
-                    rmap_peer = _rename_map(git, top, ptree, merged_tree)
-                self_broken_c, n_self_c = _canonicalise_findings(self_broken, rmap_self)
-                peer_broken_c, n_peer_c = _canonicalise_findings(peer_broken, rmap_peer)
-                new_breakage = merged_broken - self_broken_c - peer_broken_c
-                excluded = 0
-                if verdict == "conflict":
-                    # Breakage ON a conflicting path is the textual conflict
-                    # restated, not an extra semantic finding - drop it. What
-                    # survives is breakage on files entirely disjoint from the
-                    # conflict, which the old all-or-nothing gate never saw.
-                    cp = set(paths)
-                    kept = set()
-                    for x in new_breakage:
-                        first = x[0] if isinstance(x, (tuple, list)) and x else x
-                        if str(first) in cp:
-                            excluded += 1
-                        else:
-                            kept.add(x)
-                    new_breakage = kept
-                # builtin-ast findings are (path, module, name) tuples -> lists;
-                # an external checker's are whole stdout lines (strings), which
-                # list() would explode into characters. Types are homogeneous
-                # within one record (one checker per run), so the type-aware
-                # sort key is safe.
-                nb = [list(x) if isinstance(x, tuple) else x for x in new_breakage]
-                nb.sort(key=lambda x: [str(e) for e in x] if isinstance(x, list) else [x])
+                # The subtraction itself - rename canonicalisation included -
+                # is shared verbatim with `replay`, so the corpus measurement
+                # and the live tool cannot drift apart. See subtract_breakage.
+                sub = subtract_breakage(git, top, my_tree, ptree, merged_tree,
+                                        self_broken, peer_broken, merged_broken,
+                                        verdict, paths)
+                nb = sub["new_breakage"]
+                excluded = sub["excluded"]
                 # The builtin checker reports how much of the tree it could
                 # read; an external checker has no channel to (coverage is
                 # None) and its applicability is the user's explicit choice.
@@ -1649,13 +1708,10 @@ def cmd_verify(git, argv):
                                "peer": sorted(peer_linked),
                                "merged": merged_linked},
                 }
-                if rmap_self or rmap_peer:
-                    sem["renames"] = {
-                        "self": [[o, rmap_self[o]] for o in sorted(rmap_self)],
-                        "peer": [[o, rmap_peer[o]] for o in sorted(rmap_peer)],
-                    }
-                if n_self_c or n_peer_c:
-                    sem["canonicalised"] = {"self": n_self_c, "peer": n_peer_c}
+                if sub["renames"]:
+                    sem["renames"] = sub["renames"]
+                if sub["canonicalised"]:
+                    sem["canonicalised"] = sub["canonicalised"]
                 if verdict == "conflict":
                     # Omitted entirely on the clean path so existing records
                     # stay comparable.
@@ -1833,6 +1889,252 @@ def cmd_verify(git, argv):
                             (peer, sem.get("self_broken", 0), sem.get("peer_broken", 0),
                              sem.get("merged_broken", 0)))
             _linked_union_lines(r.get("semantic"))
+    return 0                          # warn-only: always 0
+
+
+def cmd_replay(git, argv):
+    """The exact `verify` mechanism on two supplied COMMITS instead of two live
+    worktrees.
+
+    `verify` can only measure what somebody is doing right now, in a worktree
+    on this machine, which makes the number it exists to justify - the
+    semantic base rate for textually clean concurrent agent work - conditional
+    on adopters. `replay` removes that condition: point it at two commits from
+    a public corpus of agent pull requests and the same textual oracle, the
+    same materialisation, the same checker and the same canonicalised
+    subtraction produce the same record. The measurement is then the shipped
+    mechanism, not a script that reimplements it, and the published method
+    reduces to "moire replay over corpus X".
+
+    Stateless by construction, because a measurement instrument that leaves
+    state behind contaminates the next reading: no log shard, no snapshot
+    cache entry, no `git add -A` snapshot, no worktree, no index, no ref. It
+    reads the object store and writes throwaway directories under $TMPDIR.
+    (`merge-tree --write-tree` does add one tree object to the store - that IS
+    the oracle, and it is unreachable from any ref; `git gc` collects it.)
+
+    Warn-only like everything else: always exits 0 once it has started, and
+    refuses with 2 only on an unusable environment or a bad argument.
+    """
+    opts, pos = _parse_argv("replay", argv, bool_flags=("--json",),
+                            value_flags=("--checker",), repeat_flags=("--link",),
+                            positional=(2, 2))
+    as_json = opts["--json"]
+    rev_a, rev_b = pos[0], pos[1]
+
+    if not _require_git(git):
+        return 2                      # refuse; nothing written
+
+    cwd = os.getcwd()
+    # NOT `rev-parse --show-toplevel`, which is what check/verify gate on. A
+    # bare clone is the corpus harness's normal environment (`git clone --bare
+    # --filter=blob:none`) and a bare repo HAS no worktree, so the worktree
+    # gate would refuse in exactly the place the measurement runs. What replay
+    # needs is the OBJECT STORE: merge-tree, archive and diff all work bare.
+    if git.out(["rev-parse", "--git-dir"], cwd=cwd) is None:
+        sys.stderr.write("moire: not inside a git repository\n")
+        return 2
+    top = git.out(["rev-parse", "--show-toplevel"], cwd=cwd)
+    # The anchor is only ever "some path inside the repo" for git to find the
+    # object store from; in a bare repo that is the repo directory itself.
+    anchor = os.path.realpath(top) if top else cwd
+
+    commit_a = git.out(["rev-parse", "--verify", "--quiet", "%s^{commit}" % rev_a], cwd=cwd)
+    if not commit_a:
+        _refuse("replay", "cannot resolve %r to a commit" % rev_a)
+    commit_b = git.out(["rev-parse", "--verify", "--quiet", "%s^{commit}" % rev_b], cwd=cwd)
+    if not commit_b:
+        _refuse("replay", "cannot resolve %r to a commit" % rev_b)
+
+    checker, checker_source = _resolve_checker(git, cwd, opts["--checker"])
+    links, link_err = _resolve_links(git, cwd, opts["--link"])
+    if link_err:
+        sys.stderr.write(link_err)
+        return 2                      # refuse; nothing written
+
+    timeout = checker_timeout()
+    t0 = time.time()
+    tree_a = git.out(["rev-parse", "--verify", "--quiet", "%s^{tree}" % commit_a], cwd=cwd)
+    tree_b = git.out(["rev-parse", "--verify", "--quiet", "%s^{tree}" % commit_b], cwd=cwd)
+    rec = {
+        "v": 2, "mode": "replay",
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        # `rev` is what the caller typed, `commit` what it resolved to: a
+        # corpus record has to be re-runnable months later, when refs/moire/A
+        # no longer exists but the OID still names the same state.
+        "self": {"rev": rev_a, "commit": commit_a, "tree": tree_a},
+        "peer": {"rev": rev_b, "commit": commit_b, "tree": tree_b},
+        "verdict": "error", "conflict_paths": [],
+        "git_version": git.version_str, "oracle": "merge-tree --write-tree",
+        # Recorded, not left to the harness to recompute: the pre-registered
+        # attrition table has "merge-base found" as its own stage, and a table
+        # derived from the JSONL alone is a table a reader can check.
+        "merge_base": git.out(["merge-base", commit_a, commit_b], cwd=anchor),
+        "duration_ms": 0, "error": None, "semantic": None,
+        "finding_id": None,
+    }
+
+    tmp_dirs = []
+    try:
+        verdict, paths, merged_tree = oracle_tree(git, anchor, commit_a, commit_b)
+        rec["verdict"] = verdict
+        rec["conflict_paths"] = paths
+        # Same gate as verify: under a textual conflict merge-tree still
+        # writes a tree, with conflict markers baked into the conflicting
+        # paths. Only builtin-ast is safe to read it (a marker-laden .py is
+        # unparsable, so it withholds judgement for that file and its
+        # importers); an external checker would emit a syntax-error cascade
+        # landing on paths that are NOT in conflict_paths.
+        if verdict == "clean" or (verdict == "conflict" and checker == "builtin-ast"):
+            self_dir = tempfile.mkdtemp(prefix="moire-replay-self-")
+            peer_dir = tempfile.mkdtemp(prefix="moire-replay-peer-")
+            merged_dir = tempfile.mkdtemp(prefix="moire-replay-merged-")
+            tmp_dirs.extend([self_dir, peer_dir, merged_dir])
+            materialize_tree(git, anchor, tree_a, self_dir)
+            materialize_tree(git, anchor, tree_b, peer_dir)
+            materialize_tree(git, anchor, merged_tree, merged_dir)
+            # A commit has no worktree of its own to borrow an untracked
+            # dependency directory from, so all three trees borrow from the
+            # CWD's worktree if there is one. Recorded per tree, like verify.
+            # The corpus harness never uses --link (tier 2 installs per
+            # materialised tree, tier 1 needs nothing), so this path is for
+            # interactive use.
+            linked = {}
+            for label, d in (("self", self_dir), ("peer", peer_dir), ("merged", merged_dir)):
+                linked[label] = sorted(link_directories(d, anchor, links)) if links else []
+            self_broken, self_cov = run_checker(checker, self_dir, timeout)
+            peer_broken, peer_cov = run_checker(checker, peer_dir, timeout)
+            merged_broken, merged_cov = run_checker(checker, merged_dir, timeout)
+            # Coherence guard. A merge of two non-empty trees cannot be
+            # empty, so a merged tree the checker found NO files in means the
+            # materialisation was truncated (a full disk, a killed tar),
+            # not that this pair had nothing to check. Without this the
+            # record would say `performed: false` and the pair would leave
+            # the measurement's denominator silently - the failure mode that
+            # shrinks a base rate's denominator without shrinking anything
+            # visible. Observed once on a monorepo under disk pressure while
+            # building this, which is why it is a check and not a comment.
+            # Only expressible for the builtin checker: an external one has
+            # no coverage channel, so the same truncation there is
+            # undetectable and is a documented limit.
+            if (merged_cov is not None and merged_cov["total"] == 0
+                    and ((self_cov and self_cov["total"]) or (peer_cov and peer_cov["total"]))):
+                raise RuntimeError(
+                    "merged tree materialised empty (%d/%d files in the parents): "
+                    "refusing to report it as 'nothing to check'"
+                    % ((self_cov or {}).get("total", 0), (peer_cov or {}).get("total", 0)))
+            sub = subtract_breakage(git, anchor, tree_a, tree_b, merged_tree,
+                                    self_broken, peer_broken, merged_broken,
+                                    verdict, paths)
+            # Nondeterminism control, pre-registered: when - and only when -
+            # a breakage survives the subtraction, the MERGED tree's checker
+            # runs twice more and only findings present in all three runs are
+            # kept. A checker that emits a timestamp, a hash-ordered set or a
+            # flaky diagnostic would otherwise contribute a "new breakage"
+            # that nothing in the pair caused. Discards are recorded, never
+            # silently dropped. Live `verify` does not pay this: the control
+            # belongs to the measurement, where a false positive costs a
+            # published number rather than one ignorable warning.
+            runs, discarded = 1, []
+            if sub["new_breakage"]:
+                stable = merged_broken
+                for _ in range(2):
+                    again, _cov = run_checker(checker, merged_dir, timeout)
+                    stable = stable & again
+                    runs += 1
+                if stable != merged_broken:
+                    before = sub["new_breakage"]
+                    sub = subtract_breakage(git, anchor, tree_a, tree_b, merged_tree,
+                                            self_broken, peer_broken, stable,
+                                            verdict, paths)
+                    kept = [json.dumps(x) for x in sub["new_breakage"]]
+                    discarded = [x for x in before if json.dumps(x) not in kept]
+                    # Every count in the record describes the SAME finding set
+                    # the verdict describes - the one that survived all three
+                    # runs. A merged_broken from run 1 next to a new_breakage
+                    # from the intersection would not subtract to each other
+                    # on anyone's arithmetic.
+                    merged_broken = stable
+            performed = (merged_cov is None) or (merged_cov["examined"] > 0)
+            sem = {
+                "checker": checker,
+                "checker_source": checker_source,
+                "performed": performed,
+                "coverage": None if merged_cov is None else {
+                    "self": self_cov, "peer": peer_cov, "merged": merged_cov},
+                "merged_tree": merged_tree,
+                "new_breakage": sub["new_breakage"],
+                "self_broken": len(self_broken),
+                "peer_broken": len(peer_broken),
+                "merged_broken": len(merged_broken),
+                "merged_checker_runs": runs,
+                "nondeterministic_discarded": discarded,
+                "duration_ms": int((time.time() - t0) * 1000),
+                "linked": linked,
+            }
+            if sub["renames"]:
+                sem["renames"] = sub["renames"]
+            if sub["canonicalised"]:
+                sem["canonicalised"] = sub["canonicalised"]
+            if verdict == "conflict":
+                sem["under_conflict"] = True
+                sem["excluded_conflict_paths"] = sub["excluded"]
+            rec["semantic"] = sem
+        # The pair is named by the two revs, where verify names it by the two
+        # worktree paths; sorted inside compute_finding_id either way, so
+        # replaying B,A yields the identical id for the identical finding.
+        rec["finding_id"] = compute_finding_id(commit_a, commit_b, _finding_tokens(rec))
+    except Exception as ex:
+        # Includes a checker timeout and a merge-tree hard failure (unrelated
+        # histories, a corrupt object). An unusable pair is an `error` record
+        # the attrition table can count - never breakage, and never a nonzero
+        # exit that would stop a corpus run partway through.
+        rec["verdict"] = "error"
+        rec["semantic"] = None
+        rec["error"] = str(ex)
+    finally:
+        for d in tmp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+    rec["duration_ms"] = int((time.time() - t0) * 1000)
+
+    if as_json:
+        sys.stdout.write(json.dumps(rec, indent=2) + "\n")
+    else:
+        short = "%s..%s" % (commit_a[:7], commit_b[:7])
+        sem = rec["semantic"] or {}
+        new = sem.get("new_breakage") or []
+        if rec["verdict"] == "error":
+            sys.stdout.write("error   %s: %s\n" % (short, rec["error"]))
+        else:
+            if rec["verdict"] == "conflict":
+                sys.stdout.write("conflict %s (%d path(s))\n" % (short, len(rec["conflict_paths"])))
+                for pth in rec["conflict_paths"]:
+                    sys.stdout.write("    %s\n" % pth)
+            if new:
+                sys.stdout.write("BROKEN  %s (%d new breakage(s), merged tree %s) [finding %s]\n" %
+                                 (short, len(new), sem.get("merged_tree"), rec["finding_id"]))
+                for item in new:
+                    sys.stdout.write("    %s\n" %
+                                     (tuple(item) if isinstance(item, list) else item,))
+            elif rec["verdict"] == "clean":
+                mcov = (sem.get("coverage") or {}).get("merged") or {}
+                if not sem.get("performed", True):
+                    # Never let silence read as "semantically fine" - the same
+                    # rule verify follows.
+                    sys.stdout.write("clean   %s (textual only - no semantic check was "
+                                     "performed)\n" % short)
+                    sys.stdout.write("  builtin-ast examined 0 of %d files: it reads only Python "
+                                     "and this tree has no .py files.\n" % mcov.get("total", 0))
+                elif mcov:
+                    sys.stdout.write("clean   %s (semantic ok: self=%d peer=%d merged=%d broken; "
+                                     "builtin-ast examined %d of %d files - python only)\n" %
+                                     (short, sem.get("self_broken", 0), sem.get("peer_broken", 0),
+                                      sem.get("merged_broken", 0),
+                                      mcov.get("examined", 0), mcov.get("total", 0)))
+                else:
+                    sys.stdout.write("clean   %s (semantic ok: self=%d peer=%d merged=%d broken)\n" %
+                                     (short, sem.get("self_broken", 0), sem.get("peer_broken", 0),
+                                      sem.get("merged_broken", 0)))
     return 0                          # warn-only: always 0
 
 
@@ -2927,6 +3229,11 @@ moire - observed-diff conflict detection between concurrent git worktrees
                                     node_modules) from each worktree into its materialised
                                     tree so external checkers can resolve dependencies
                                     without either flag, reads the git config keys below
+  moire replay <rev-a> <rev-b> [--checker <cmd>] [--link <name>]... [--json]
+                                    the same mechanism on two COMMITS instead of two live
+                                    worktrees: the measurement instrument. Stateless - no
+                                    log, no cache, no snapshot, no worktree - and it works
+                                    in a bare clone, which is how a corpus is replayed.
   moire doctor                         verify git version, hooks, install, state dir
   moire install [--print-client-hooks] install git hooks into $GIT_COMMON_DIR/hooks/
   moire init-swarm --agents N [--prefix agent] [--skills user|project|none] [--dry-run]
@@ -2974,6 +3281,8 @@ def main(argv):
         return cmd_check(git, rest)
     if cmd == "verify":
         return cmd_verify(git, rest)
+    if cmd == "replay":
+        return cmd_replay(git, rest)
     if cmd == "doctor":
         return cmd_doctor(git, rest)
     if cmd == "install":
