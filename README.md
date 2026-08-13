@@ -18,10 +18,6 @@ can't overwrite each other. Then you combine their work, and it breaks:
 > Their file sets are **disjoint**, so git merges them cleanly — no conflict markers,
 > no warning. The merged result calls a function that is no longer there.
 
-Or, as a house: one builder moves the front door to the side. Another builds a garden
-path up to where the front door used to be. Neither touched the other's work. Both
-jobs are individually correct. Together you have a path leading to a wall.
-
 **Git catches overlapping *lines*. It cannot catch overlapping *meaning*.** CI
 catches it only after both changes have landed, when unwinding is expensive and both
 agents have moved on.
@@ -227,8 +223,8 @@ proves an import still resolves — both the module and the name it takes from i
 not that its contract held. An import of a module that is not in the tree is
 recorded as a finding, `os` and `numpy` included, and the subtraction throws those
 away: they are unresolvable in all three trees and cancel, while a module one agent
-deleted or `git mv`d is unresolvable only in the merge — one agent moving the door
-while the other builds a path to where it was. `tests/benchmark_recall.sh` measures
+deleted or `git mv`d is unresolvable only in the merge — which is precisely the
+collision being looked for. `tests/benchmark_recall.sh` measures
 what it catches, graded by CPython rather than by moire: **9 of 11** textually clean
 collisions, **0 of 7** clean merges reported as broken. [What that score does and
 does not mean](docs/MEASUREMENTS.md#what-9-of-11-measures) is worth reading before
