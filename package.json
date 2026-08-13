@@ -1,46 +1,8 @@
 {
   "name": "@jamescazzetta/moire",
-  "version": "0.12.0",
-  "description": "Tells parallel AI coding agents when their in-flight work would break each other — before either lands. Catches the case git merges cleanly.",
-  "keywords": [
-    "ai-agents",
-    "multi-agent",
-    "git",
-    "worktree",
-    "merge-conflict",
-    "semantic-conflict",
-    "llm",
-    "claude-code",
-    "developer-tools"
-  ],
-  "homepage": "https://github.com/jamescazzetta/moire#readme",
-  "bugs": {
-    "url": "https://github.com/jamescazzetta/moire/issues"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/jamescazzetta/moire.git"
-  },
-  "license": "MIT",
-  "author": "James Cazzetta",
-  "type": "commonjs",
-  "bin": {
-    "moire": "bin/moire.js"
-  },
-  "files": [
-    "bin/moire",
-    "bin/moire.js",
-    "skills/",
-    "README.md",
-    "LICENSE"
-  ],
-  "engines": {
-    "node": ">=14"
-  },
+  "version": "0.13.0",
+  "private": true,
   "scripts": {
     "test": "bash tests/test_oracle.sh && bash tests/test_install.sh && bash tests/test_report.sh && bash tests/test_setup.sh && bash tests/test_verify.sh && bash tests/benchmark_recall.sh"
-  },
-  "publishConfig": {
-    "access": "public"
   }
 }
