@@ -82,7 +82,8 @@ mkdir -p ~/.local/bin && curl -fsSL \
   -o ~/.local/bin/moire && chmod +x ~/.local/bin/moire
 ```
 
-There is no npm package. `package.json` exists in this repository and
+There is no npm package. The repository no longer carries npm packaging at all —
+`package.json` is a private manifest that exists only to run `npm test`.
 `@jamescazzetta/moire` has never been published; if you find that name on a
 registry, it is not this project.
 
@@ -680,14 +681,13 @@ The full map, with each source's verification status, is in
 
 ```
 bin/moire            the tool — a single file, Python 3.8, standard library only
-bin/moire.js         Node launcher, retained for a distribution that does not exist yet
 skills/              two Agent Skills: one for acting on a finding, one for
                      setting up parallel work
 tests/               98 cases across five suites, plus the negative control and
                      the recall benchmark
 tools/replay-corpus/ the Phase 1 measurement harness (stdlib only, not shipped)
 PHASE1-PREREGISTRATION.md   the decision rule, committed before any data
-package.json         npm packaging metadata; nothing is published
+package.json         private test-runner manifest — `npm test` only, never published
 README.md            this file
 LICENSE              MIT
 ```
