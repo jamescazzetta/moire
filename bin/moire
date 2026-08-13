@@ -2739,12 +2739,12 @@ def cmd_wire_client(git, argv):
 
 # ---------------------------------------------------------------- init-swarm
 #
-# Collapses the manual six-step procedure in the README's Install section
+# Collapses the manual six-step procedure in docs/INSTALL.md
 # (worktrees, install, client hooks, skill, doctor) into one command.
 # HARD SCOPE LIMIT: this creates worktrees and wires the tool. It never
 # decides what an agent works on, assigns tasks, partitions files, or writes
 # a task description - work partitioning is explicitly out of scope for this
-# project (see the README's account of what was tried and thrown away).
+# project (see docs/MEASUREMENTS.md, what was tried and thrown away).
 
 def _tree_differs(a, b):
     """True if two directory trees differ in file set or byte CONTENT - never
