@@ -1269,6 +1269,9 @@ COMMAND_USAGE = {
     "report": "usage: moire report [--json]",
     "doctor": "usage: moire doctor",
     "install": "usage: moire install [--print-client-hooks]",
+    "pending": "usage: moire pending [--json]",
+    "compose": ("usage: moire compose <finding-id> "
+                "[--action rebase|narrow|retarget|wait|proceed] [--json]"),
 }
 
 
@@ -3200,6 +3203,22 @@ def cmd_report(git, argv):
     distinct_textual = sum(1 for m in meta.values() if m["kind"] == "textual")
     distinct_semantic = sum(1 for m in meta.values() if m["kind"] == "semantic")
 
+    # --- cleared vs outstanding -------------------------------------------
+    # `live` (computed by _finding_lifecycle) already answers exactly this:
+    # a finding is outstanding when it is still what the latest record for
+    # its pair produces, cleared when a later record for that same pair
+    # stopped producing it. Reusing `live` rather than re-deriving keeps this
+    # in lockstep with the "findings (... live=yes/no)" section below - the
+    # two can never disagree, because they read the same field.
+    #
+    # "Cleared" is deliberately not "resolved": the pair-state stopped
+    # producing the finding for any reason - one side landed, rebased,
+    # narrowed, or simply abandoned the work - and nothing here attributes
+    # cause. It is the instrument for a future clearance-rate study, not a
+    # claim that any agent did the right thing.
+    distinct_cleared = sum(1 for m in meta.values() if not m["live"])
+    distinct_outstanding = sum(1 for m in meta.values() if m["live"])
+
     # --- raw observations (transparency, never a denominator) -------------
     obs_pairs = [r for r in records if r.get("verdict") in ("clean", "conflict")]
     obs_conflicts = [r for r in obs_pairs if r["verdict"] == "conflict"]
@@ -3233,6 +3252,12 @@ def cmd_report(git, argv):
             "semantic_rate": semantic_rate,
             "distinct_findings": {"textual": distinct_textual,
                                   "semantic": distinct_semantic},
+            # Additive alongside distinct_findings, not nested in it: these
+            # partition by STATUS (still producing vs not), a different axis
+            # than kind's textual/semantic. See the docstring above meta's
+            # computation for what "cleared" does and does not claim.
+            "findings_cleared": distinct_cleared,
+            "findings_outstanding": distinct_outstanding,
             "findings": findings,
             "top_paths": top_paths,
             "semantic_findings_under_conflict": len(under_conflict_findings),
@@ -3272,6 +3297,9 @@ def cmd_report(git, argv):
                          % (100.0 * semantic_rate, semantic_states))
     sys.stdout.write("distinct findings                 : %d textual, %d semantic\n"
                      % (distinct_textual, distinct_semantic))
+    sys.stdout.write("%-34s: %d cleared, %d outstanding   (cleared = the pair-state stopped\n"
+                     "                                    producing it; cause is not implied)\n"
+                     % ("findings cleared / outstanding", distinct_cleared, distinct_outstanding))
     sys.stdout.write("raw observations                  : %d pair records, %d conflicts, "
                      "%d semantic, %d breakage\n"
                      % (len(obs_pairs), len(obs_conflicts), len(obs_semantic), len(obs_breakage)))
@@ -3290,6 +3318,317 @@ def cmd_report(git, argv):
             sys.stdout.write("  %s  %-8s  seen=%-4d first=%s  last=%s  live=%s\n" % (
                 m["finding_id"], m["kind"], m["times_seen"],
                 m["first_seen"], m["last_seen"], "yes" if m["live"] else "no"))
+    return 0
+
+
+# ------------------------------------------------------------ pending / compose
+#
+# The resolution layer's two query surfaces. Both read the log the same way
+# `report` does (_read_log_records, RECORD_VERSION-only) and write NOTHING -
+# no snapshot, no cache touch, no log shard, no read of any peer worktree.
+# That is not an optimisation; it is the whole point: an agent must be able
+# to run `pending` at session start and before declaring work done, and
+# `compose` every time it wants to hand a finding to another agent, with
+# zero cost and zero risk of racing `check`/`verify`'s own shard writes.
+#
+# Neither command ever executes a rebase, opens a socket, or otherwise
+# reaches beyond the log - moire composes a message; it does not send one.
+# See the module docstring's "warn-only" note and research/design-v13 for
+# why sending stays out of scope for good (discovery, identity, retry, and a
+# config surface all follow from it, and each one is a vendor coupling this
+# tool does not take on).
+
+def _parse_ts(ts):
+    """-> a tz-aware UTC datetime for a check/verify `ts` field, or None."""
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _age_seconds(ts):
+    """-> whole seconds since `ts`, never negative (a clock skew that makes
+    `ts` look future reads as 0, not a confusing negative age), or None."""
+    t = _parse_ts(ts)
+    if t is None:
+        return None
+    return max(0, int((datetime.now(timezone.utc) - t).total_seconds()))
+
+
+def _fmt_age_secs(secs):
+    if secs < 60:
+        return "%ds" % secs
+    mins, secs = divmod(secs, 60)
+    if mins < 60:
+        return "%dm" % mins
+    hours, mins = divmod(mins, 60)
+    if hours < 24:
+        return "%dh%dm" % (hours, mins)
+    days, hours = divmod(hours, 24)
+    return "%dd%dh" % (days, hours)
+
+
+def _fmt_age(ts):
+    secs = _age_seconds(ts)
+    return None if secs is None else _fmt_age_secs(secs)
+
+
+def _finding_facts(rec):
+    """-> (kind, items, meaning) for a record carrying a finding_id.
+
+    kind: 'textual' or 'semantic', from `_finding_kind` - the same predicate
+    `report` already uses, so pending/compose and report can never disagree
+    about what a given record IS.
+    items: contested paths (textual) or breakage triples (semantic), each
+    already display-ready (a JSON round-tripped tuple restored from a list).
+    meaning: the one-line consequence, in the exact words SKILL.md already
+    teaches an agent to expect - reused, not reinvented, so a composed
+    message and the skill read as one voice.
+    """
+    kind = _finding_kind(rec)
+    if kind == "textual":
+        items = list(rec.get("conflict_paths") or [])
+        meaning = "git will stop with conflict markers here"
+    else:
+        sem = rec.get("semantic") or {}
+        items = [tuple(x) if isinstance(x, list) else x
+                for x in (sem.get("new_breakage") or [])]
+        meaning = "git merges this cleanly; the result is broken"
+    return kind, items, meaning
+
+
+def cmd_pending(git, argv):
+    """What findings exist right now between me and each peer, per the log
+    alone - what an agent consults at session start and before declaring
+    work done. Groups THIS worktree's own logged records by peer, takes the
+    latest one per peer, and shows it only if that latest record still
+    carries a finding_id: a finding that appeared in an earlier record but
+    is absent from the latest one for the same pair is cleared, and cleared
+    findings are not shown here (only counted, by `report`).
+
+    Read-only by construction: nothing below ever opens a log file for
+    writing, touches the snapshot cache, or reads a peer worktree's files -
+    only records THIS worktree already wrote to the shared log on some
+    earlier `check`/`verify` are consulted. "Right now" is therefore a claim
+    about the log, not the worktrees, which is why every line carries a
+    record age and the output always ends by saying so.
+    """
+    opts, _pos = _parse_argv("pending", argv, bool_flags=("--json",))
+    as_json = opts["--json"]
+
+    cwd = os.getcwd()
+    cd = common_dir(git, cwd) if git.path else None
+    if not cd:
+        sys.stderr.write("moire: not inside a git worktree\n")
+        return 2
+    top = git.out(["rev-parse", "--show-toplevel"], cwd=cwd)
+    if not top:
+        sys.stderr.write("moire: not inside a git worktree\n")
+        return 2
+    top = os.path.realpath(top)
+
+    ld = log_dir(cd)
+    all_records, _checks = _read_log_records(ld)
+    records = [r for r in all_records if r.get("v") == RECORD_VERSION]
+    pre_v2 = len(all_records) - len(records)
+
+    # Only records THIS worktree logged as "self" - pending answers "what do
+    # I know about each peer", not "what does the shared log know about any
+    # pair regardless of who ran the check", which is `report`'s question
+    # (it uses the unordered _pair_key instead, on purpose - see there).
+    by_peer = {}
+    for r in records:
+        if (r.get("self") or {}).get("worktree") != top:
+            continue
+        p = (r.get("peer") or {}).get("worktree")
+        if not p:
+            continue
+        by_peer.setdefault(p, []).append(r)
+
+    outstanding = []
+    for _peer_wt, rs in by_peer.items():
+        latest = max(rs, key=lambda r: (r.get("ts") or "", r.get("check_id") or ""))
+        if latest.get("finding_id"):
+            outstanding.append(latest)
+    outstanding.sort(key=lambda r: ((r.get("peer") or {}).get("worktree") or "",
+                                    r.get("ts") or ""))
+
+    if as_json:
+        out = []
+        for r in outstanding:
+            kind, items, meaning = _finding_facts(r)
+            out.append({
+                "finding_id": r.get("finding_id"), "kind": kind,
+                "self": r.get("self"), "peer": r.get("peer"),
+                "verdict": r.get("verdict"), "items": _sorted_findings(items),
+                "meaning": meaning, "arbiter": r.get("arbiter"),
+                "ts": r.get("ts"), "age_seconds": _age_seconds(r.get("ts")),
+            })
+        sys.stdout.write(json.dumps({
+            "pre_v2_records_ignored": pre_v2,
+            "outstanding": out,
+        }, indent=2) + "\n")
+        return 0
+
+    sys.stdout.write("pre-v2 records ignored            : %d%s\n" %
+                     (pre_v2, "  (delete .git/moire/log to reset)" if pre_v2 else ""))
+
+    if not outstanding:
+        sys.stdout.write("moire: no outstanding findings\n")
+        sys.stdout.write("(from the log; re-run 'moire check' for a live answer)\n")
+        return 0
+
+    for r in outstanding:
+        kind, items, meaning = _finding_facts(r)
+        peer_wt = r["peer"]["worktree"]
+        branch = r["peer"].get("branch") or "detached"
+        age = _fmt_age(r.get("ts")) or "unknown"
+        label = "CONFLICT" if kind == "textual" else "BROKEN"
+        sys.stdout.write("%s with %s (%s) [finding %s] kind=%s age=%s\n" %
+                         (label, peer_wt, branch, r.get("finding_id"), kind, age))
+        for it in _sorted_findings(items):
+            sys.stdout.write("    %s\n" % (tuple(it) if isinstance(it, list) else it,))
+        arb = r.get("arbiter")
+        if arb:
+            sys.stdout.write("  arbiter: %s yields (%s)\n" % (arb["yield"], arb["reason"]))
+
+    ages = [a for a in (_age_seconds(r.get("ts")) for r in outstanding) if a is not None]
+    if ages:
+        sys.stdout.write("(from the log; oldest of the above is %s old; "
+                         "re-run 'moire check' for a live answer)\n" % _fmt_age_secs(max(ages)))
+    else:
+        sys.stdout.write("(from the log; re-run 'moire check' for a live answer)\n")
+    return 0
+
+
+COMPOSE_ACTIONS = ("rebase", "narrow", "retarget", "wait", "proceed")
+
+# Each value is the SENDER's own self-binding statement of what they chose -
+# never a demand on the receiver, who decides only after re-verifying
+# locally (see cmd_compose's VERIFY section and the skill's resolution
+# protocol). "sender" here names the agent composing the message, not
+# moire: moire composes the text below and performs none of these actions.
+ACTION_STATEMENTS = {
+    "rebase": "sender is rebasing their own work onto the peer's",
+    "narrow": "sender is narrowing their own change to drop the contested part",
+    "retarget": "sender is retargeting their own work onto what already exists in the peer's",
+    "wait": "sender is waiting for the peer to land before continuing here",
+    "proceed": "sender is proceeding as-is",
+}
+
+
+def cmd_compose(git, argv):
+    """Render one finding, looked up by id in the log, as a message shaped
+    for pasting into another agent's session via whatever transport the
+    CALLER's harness provides (Claude Code cross-session messaging, agent
+    teams, A2A, ...). moire never transmits it: no discovery, no identity,
+    no retry, no config surface - composing the text is the boundary, and
+    the agent on the other end of that call is the one who moves it.
+
+    Read-only, same as `pending`: no snapshot, no log write. The staleness
+    safeguard is the protocol itself, not this command - the receiver
+    re-verifies locally with their own `moire check`/`moire verify`, so a
+    stale compose costs a re-check, never a wrong action taken on faith.
+    """
+    opts, pos = _parse_argv("compose", argv, bool_flags=("--json",),
+                            value_flags=("--action",), positional=(1, 1))
+    as_json = opts["--json"]
+    action = opts["--action"]
+    if action is not None and action not in COMPOSE_ACTIONS:
+        _refuse("compose", "--action must be one of %s, got %r" %
+               ("|".join(COMPOSE_ACTIONS), action))
+    fid = pos[0]
+
+    cwd = os.getcwd()
+    cd = common_dir(git, cwd) if git.path else None
+    if not cd:
+        sys.stderr.write("moire: not inside a git worktree\n")
+        return 2
+
+    ld = log_dir(cd)
+    all_records, _checks = _read_log_records(ld)
+    matches = [r for r in all_records
+              if r.get("v") == RECORD_VERSION and r.get("finding_id") == fid]
+    if not matches:
+        # Refused before any write - same discipline as every other command
+        # here, and there IS nothing this command ever writes. `moire
+        # replay` computes a finding_id (per the same algorithm) but never
+        # touches the log at all - stateless by construction - so its ids
+        # can never be looked up here. That is worth saying explicitly: a
+        # caller who copied an id out of a `replay` run needs to know why it
+        # is refused, not just that it is unknown.
+        _refuse("compose",
+               "no finding %r in the log. 'moire replay' writes no log, so a "
+               "finding it reports can never be composed here - only "
+               "findings from 'moire check'/'moire verify' are. A finding "
+               "also stops appearing once its pair-state clears - run "
+               "'moire pending' to see what is outstanding now." % fid)
+
+    rec = max(matches, key=lambda r: (r.get("ts") or "", r.get("check_id") or ""))
+    kind, items, meaning = _finding_facts(rec)
+    items = _sorted_findings(items)
+    self_ = rec.get("self") or {}
+    peer = rec.get("peer") or {}
+    arb = rec.get("arbiter")
+    age = _fmt_age(rec.get("ts"))
+    verify_cmd = "moire check" if kind == "textual" else "moire verify"
+    merged_tree = (rec.get("semantic") or {}).get("merged_tree") if kind == "semantic" else None
+
+    if as_json:
+        sys.stdout.write(json.dumps({
+            "finding_id": fid, "kind": kind,
+            "from": {"worktree": self_.get("worktree"), "branch": self_.get("branch"),
+                     "head": self_.get("head"), "ts": rec.get("ts"),
+                     "age_seconds": _age_seconds(rec.get("ts"))},
+            "peer": {"worktree": peer.get("worktree"), "branch": peer.get("branch")},
+            "fact": {"verdict": rec.get("verdict"), "items": items,
+                    "merged_tree": merged_tree, "meaning": meaning},
+            "arbiter": arb,
+            "sender_action": action,
+            "verify_command": verify_cmd,
+        }, indent=2) + "\n")
+        return 0
+
+    lines = []
+    lines.append("moire finding %s" % fid)
+    lines.append("(computable identically from your side - derived only from the two "
+                 "worktree paths and the contested paths/breakage, never from anything "
+                 "either of us declares)")
+    lines.append("")
+    lines.append("FROM")
+    lines.append("  worktree : %s" % self_.get("worktree"))
+    lines.append("  branch   : %s" % (self_.get("branch") or "detached"))
+    lines.append("  HEAD     : %s" % (self_.get("head") or "unknown"))
+    lines.append("  age      : %s" % (age or "unknown"))
+    lines.append("")
+    lines.append("THE FACT")
+    lines.append("  %s" % ("CONFLICT" if kind == "textual" else "BROKEN"))
+    lines.append("  verdict: %s" % rec.get("verdict"))
+    if kind == "textual":
+        lines.append("  contested path(s): %d" % len(items))
+    else:
+        lines.append("  breakage(s): %d%s" % (len(items),
+                     (" (merged tree %s)" % merged_tree) if merged_tree else ""))
+    for it in items:
+        lines.append("    %s" % (tuple(it) if isinstance(it, list) else it,))
+    lines.append("  meaning: %s" % meaning)
+    lines.append("")
+    if arb:
+        lines.append("ARBITER")
+        lines.append("  %s yields (%s)" % (arb["yield"], arb["reason"]))
+        lines.append("  computed from facts observable to both of us; your moire will "
+                     "say the same")
+        lines.append("")
+    lines.append("SENDER'S ACTION")
+    lines.append("  %s" % (ACTION_STATEMENTS[action] if action else
+                           "sender has not chosen an action yet"))
+    lines.append("")
+    lines.append("VERIFY")
+    lines.append("  run `%s` in your own worktree - the same finding id (%s) confirms it"
+                 % (verify_cmd, fid))
+    sys.stdout.write("\n".join(lines) + "\n")
     return 0
 
 
@@ -3320,8 +3659,17 @@ moire - observed-diff conflict detection between concurrent git worktrees
                                     plan (default) or write (--apply) the client hook that
                                     runs `moire check` after every tool use. Always diffs
                                     before writing, writes atomically, keeps a backup.
-  moire report [--json]                rates over distinct pair-states, distinct findings, and
-                                    contested paths, from the log
+  moire report [--json]                rates over distinct pair-states, distinct findings
+                                    (cleared vs still outstanding), and contested paths,
+                                    from the log
+  moire pending [--json]               what findings exist right now between me and each
+                                    peer, from the log only - never writes, never reads a
+                                    peer worktree; cleared findings are not shown (see
+                                    'moire report' for cleared/outstanding counts)
+  moire compose <finding-id> [--action rebase|narrow|retarget|wait|proceed] [--json]
+                                    render one finding as a message shaped for another
+                                    agent's session - read-only; moire composes the text,
+                                    the calling agent's own transport moves it
 
 Env vars:
   MOIRE_AGENT_ID       string, default unset - a provenance label recorded on your own
@@ -3368,6 +3716,10 @@ def main(argv):
         return cmd_wire_client(git, rest)
     if cmd == "report":
         return cmd_report(git, rest)
+    if cmd == "pending":
+        return cmd_pending(git, rest)
+    if cmd == "compose":
+        return cmd_compose(git, rest)
     sys.stderr.write("moire: unknown command %r\n\n%s" % (cmd, USAGE))
     return 2
 
