@@ -258,16 +258,11 @@ git config --add moire.link node_modules
 moire doctor      # warns when `verify` would have nothing to read
 ```
 
-This is `git config`, not a file committed to the repository, and the difference is
-the point: `.git/config` is never cloned, so a checkout cannot carry a command that
-runs on someone else's machine. It lives in `$GIT_COMMON_DIR`, so one setting covers
-every worktree of the swarm. `--checker` and `--link` still work and take
-precedence.
-
-Because the set difference is computed over the checker's output *lines*, a checker
-has to be deterministic and emit one finding per line with repo-relative paths.
-Break those rules and you get false breakage rather than silence — read the
-contract before pointing `--checker` at something.
+This is `git config`, never cloned with the repository — a checkout cannot carry a
+command that runs on someone else's machine — and one setting covers every worktree
+of the swarm. A checker must be deterministic, one repo-relative finding per line;
+break that and you get false breakage rather than silence. Read the contract before
+pointing `--checker` at anything:
 
 <details>
 <summary><strong>The <code>--checker</code> contract</strong> — read this before writing or choosing one</summary>
@@ -364,13 +359,11 @@ ARBITER
   recommendation: the sender (this side) yields
   reason: adoptability: self has uncommitted work, peer is fully committed
   computed from facts observable to both of us; your moire reports the same recommendation - its 'self' is you
-
-SENDER'S ACTION
-  sender is rebasing their own work onto the peer's
-
-VERIFY
-  run `moire verify` in your own worktree - the same finding id (c7c86b514435) confirms it
 ```
+
+Two further sections follow, truncated here: `SENDER'S ACTION` (the sender's own
+chosen action, from `--action`) and `VERIFY` (the command the receiver runs, and
+that the same finding id confirms it). Run it to see the whole message.
 
 Four things in that message are load-bearing:
 
