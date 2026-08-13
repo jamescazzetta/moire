@@ -280,9 +280,11 @@ Neither skill decides how to split the work. That judgement stays with you.
 | `moire check` | Would my worktree conflict **textually** with each peer, right now? |
 | `moire verify` | Would the merged result be **semantically broken**, right now? Reads `moire.checker` / `moire.link` from `git config` when `--checker` / `--link` are absent. |
 | `moire replay <a> <b>` | The `verify` mechanism on two **commits** instead of two live worktrees — the measurement instrument. Stateless: no log, no cache, no snapshot, and it works in a bare clone. |
+| `moire pending` | What findings are outstanding between me and each peer, **according to the log** — read-only, no new observation. Prints each finding's age and says to re-run `check` for a live answer. |
+| `moire compose <id>` | Render one finding as a message for whatever channel your harness has, with the id the receiver re-computes from their own run. `--action rebase\|narrow\|retarget\|wait\|proceed` states what the sender chose. moire has no transport; the agent sends it. |
 | `moire install` | Install git hooks and the binary into `.git/` |
 | `moire doctor` | Check git version, hook wiring, install state |
-| `moire report` | Rates over distinct pair-states, distinct findings, contested paths |
+| `moire report` | Rates over distinct pair-states, distinct findings, contested paths, and how many findings have cleared |
 | `moire init-swarm` | Create N worktrees, install, place the skills, run doctor |
 | `moire wire-client` | Merge the hook into a client's settings (diff, then `--apply`) |
 
@@ -406,6 +408,116 @@ which normal commit and fetch activity already triggers. moire never deletes an
 object; `moire doctor` warns if loose objects ever accumulate past git's own `gc.auto`
 threshold.
 
+## From finding to conversation
+
+A finding is only worth what happens next, and the two halves of *next* shipped
+separately.
+
+Agent messaging is **transport with no trigger**. Claude Code's cross-session messaging
+is explicit about its scope — *"a message is a piece of text one Claude writes to
+another, never conversation history or files"* — and a collision warning carried that
+way fires only if an agent notices the collision, decides to send, and picks the right
+session. moire is the mirror image: a **trigger with no transport**. It notices the
+fact, names it, and prints it to a terminal the other agent is not reading.
+
+0.13 joins them, and the join is one command wide. moire composes the message; the agent
+sends it.
+
+`moire pending` answers *what is outstanding between me and each peer* from the log
+alone: no snapshot, no peer worktree read, nothing written. A suite case pins that by
+fingerprinting `.git/moire/` around five `pending`/`compose` invocations and asserting
+it is unchanged. It is what an agent consults at session start and before declaring work
+done, and each finding is judged against the latest record **of its own kind**: every record
+answers the textual question, but a plain `check` never asks the semantic one, so a
+`check` on a per-write hook cannot clear a `BROKEN` finding it never re-examined.
+
+Run here 2026-08-13, in a two-worktree lab repo holding the disjoint-edit example from
+the top of this README — agent A renamed `validate_session` and has not committed, agent
+B committed a new file calling the old name:
+
+```
+$ moire pending
+pre-v2 records ignored            : 0
+BROKEN with /private/tmp/moire-lab/repo-agent-b (feat/b) [finding c7c86b514435] kind=semantic age=1s
+    ('src/service.py', 'src.auth', 'validate_session')
+  arbiter: self yields (adoptability: self has uncommitted work, peer is fully committed)
+(from the log; oldest of the above is 1s old; re-run 'moire check' for a live answer)
+```
+
+`moire compose <finding-id>` renders one of those findings as a message, shaped for
+pasting into whatever channel the harness provides:
+
+```
+$ moire compose c7c86b514435 --action rebase
+moire finding c7c86b514435
+(computable identically from your side - derived only from the two worktree paths and the contested paths/breakage, never from anything either of us declares)
+
+FROM
+  worktree : /private/tmp/moire-lab/repo-agent-a
+  branch   : feat/a
+  HEAD     : 85b6928df15065d9bf8c71fae8f6566e5a91ec8f
+  age      : 11s
+
+THE FACT
+  BROKEN
+  textually: clean - git reports no conflict
+  breakage(s): 1 (merged tree 9b6548b2e379d20e5ab061e7820f750d4d577a46)
+    ('src/service.py', 'src.auth', 'validate_session')
+  meaning: git merges this cleanly; the result is broken
+
+ARBITER
+  recommendation: the sender (this side) yields
+  reason: adoptability: self has uncommitted work, peer is fully committed
+  computed from facts observable to both of us; your moire reports the same recommendation - its 'self' is you
+
+SENDER'S ACTION
+  sender is rebasing their own work onto the peer's
+
+VERIFY
+  run `moire verify` in your own worktree - the same finding id (c7c86b514435) confirms it
+```
+
+Four things in that message are load-bearing:
+
+- **The finding id is the receiver's own check, not the sender's word.** It is
+  content-addressed — derived from the two worktree paths and the contested paths or
+  breakage — so both sides compute it independently and get the same string. Verified in
+  the same lab run: agent B's own `moire verify`, run from the other worktree, reported
+  `[finding c7c86b514435]` for the same pair.
+- **It composes only from records this side logged.** That same id also sits in the
+  peer's records with `self` and `peer` swapped, and rendering one of those would
+  produce a message naming its receiver as its own sender. Composing an id only the peer
+  has logged refuses with exit 2: *"finding '…' was recorded from another worktree's
+  runs, not this one's"*, and says to run `check` or `verify` here first.
+- **The arbiter is translated across the boundary.** The stored record says `self
+  yields` relative to whoever ran the check; the message says *the sender (this side)*
+  and notes that the labels flip. In the same lab run B's `moire verify` printed
+  `arbiter: peer yields` for the identical fact — the same recommendation, read from the
+  other end.
+- **`SENDER'S ACTION` binds only the sender.** It is the sender's own chosen action,
+  never a demand; with no `--action` the message says the sender has not chosen yet.
+
+The receiving agent's first move is not to act on the message. It is to re-run `moire
+check` or `moire verify` in its own worktree; the same finding id coming back from its
+own run is the confirmation, and until that happens the message is another agent's
+claim, not evidence. `skills/moire/SKILL.md` instructs the receiving side in exactly
+those terms.
+
+**moire never transmits any of this.** There is no `moire send`, no socket, no
+discovery, no inbox and no delivery state; `compose` is a pure function of the log that
+writes to stdout. That is a boundary, not a gap to be filled later: owning the wire
+means owning identity, retry and a config surface, and a tool that does can only be one
+harness's tool. The agent owns the wire.
+
+**Whether any of this changes what agents do is unmeasured.** It is exactly as
+unmeasured as warn-only was: nobody here has shown that a finding which reaches the
+other agent alters what that agent then writes. What 0.13 adds is that the question
+becomes answerable. `moire report` now prints `findings cleared / outstanding`, where
+*cleared* means a later check of the same kind no longer reports the finding —
+`(cause is not implied)`, in the tool's own words, because one side may have rebased,
+narrowed, landed or simply abandoned the work. That is the instrument for a clearance
+study, not the study, and no data exists yet.
+
 ## What observation writes, and where
 
 "The peer needs zero participation" has a cost, and it is the peer's: **a peer cannot
@@ -440,7 +552,7 @@ designs, and they are why moire is shaped the way it is.
 | Approach | Example | What happened |
 | --- | --- | --- |
 | **Agents declare what they will touch**; a registry arbitrates | MCP Agent Mail, Agent Claim MCP, [wit](https://github.com/amaar-mc/wit), [grit](https://github.com/rtk-ai/grit) | Advisory by their own documentation — nothing enforces a claim — or enforced by a lock registry every agent must join. All fail open the moment one agent, say another vendor's, doesn't participate. |
-| **Let the agents talk to each other** | Claude Code cross-session messaging | Shipped by the vendor, and explicitly transport: *"a message is a piece of text one Claude writes to another, never conversation history or files."* It fires only if an agent notices the collision, decides to send, and picks the right session. |
+| **Let the agents talk to each other** | Claude Code cross-session messaging | Shipped by the vendor, and explicitly transport: *"a message is a piece of text one Claude writes to another, never conversation history or files."* It fires only if an agent notices the collision, decides to send, and picks the right session. moire 0.13 is the noticing-and-composing half of exactly that pipeline — [`pending` and `compose`](#from-finding-to-conversation) — without becoming the transport. |
 | **Detect overlap at pull-request time** | [ConE](https://arxiv.org/abs/2101.06542) (Microsoft Research + TU Delft) | Works, at scale — flagged 775 of 26,000 pull requests (3.33%) across 234 repositories; 554 of those 775 notifications (71.48%) were flagged "Resolved" *by users*, which is a user rating and not precision against ground truth. Detects *file* overlap, after both branches already exist, and ships as a comment. |
 | **Warn human developers proactively** | Crystal ([Brun et al., ESEC/FSE 2011](https://cs.uwaterloo.ca/~rtholmes/papers/fse_2011_brun.pdf)) | moire's direct ancestor: it merged peers' committed code, built it, ran its tests, and showed a per-peer icon. Nine systems, 3.4M LOC, 550,000 development versions. Fifteen years later, no published evidence of durable industrial adoption for it or any of its successors. |
 | **Isolate, merge later** | every commercial agent orchestrator | Works, and defers the problem to a human at merge time. This is what everyone actually ships. |
@@ -550,6 +662,14 @@ attrition ladder; it establishes that the harness runs, and nothing else. The ha
 refuses to print a semantic rate until the 500-pair minimum, the calibration check and
 the audit have all been affirmed.
 
+**`moire pending` and `moire compose`: new, and unmeasured in a second way.** `pending`
+lists what the log says is still outstanding against each peer; `compose` renders one
+finding as a message for whatever channel the harness provides, and moire has no
+transport of its own. Whether a finding that reaches the other agent changes what that
+agent does is unmeasured — [`report`'s cleared/outstanding
+counts](#from-finding-to-conversation) are the instrument for measuring it, and no data
+exists yet.
+
 An earlier search of *human* open-source history turned up little, but that says less
 than it sounds like: it covered one failure mode (cross-module references, not changed
 signatures or arity mismatches) on the wrong population. Human teams also coordinate
@@ -557,6 +677,55 @@ socially — issue claiming, standups, "I'm taking that module" — which agents
 dispatched in parallel do not.
 
 So this is a working instrument aimed at an open quantity, not a proven product.
+
+## What changed in 0.13
+
+- **`moire pending` is new** — the read-only query surface. It groups this worktree's own
+  logged records by peer and prints what is still outstanding against each: finding id,
+  kind, peer path and branch, the contested paths or breakage triples, the arbiter line,
+  and the age of the record it came from. No snapshot, no peer worktree read, no log
+  write. Every run says it is answering from the log and to re-run `check` for a live
+  answer, because a log is a view of the past.
+- **`moire compose <finding-id>` is new** — [one finding rendered as a
+  message](#from-finding-to-conversation) for whatever channel the agent's harness has.
+  It composes only from records this side logged, translates the arbiter into
+  sender/receiver terms, states the sender's own chosen action if `--action` was given,
+  and ends with the command the receiver runs to confirm the same id themselves. moire
+  has no transport and gains none: `compose` prints, and the agent moves it.
+- **`moire report` counts findings cleared and outstanding.** A finding is cleared when a
+  later check *of the same kind* no longer reports it. The line says
+  `(cause is not implied)` in the output itself, because clearance does not distinguish
+  a rebase from an abandonment. It is the instrument for measuring whether the
+  [finding-to-message loop](#from-finding-to-conversation) changes anything, and that
+  measurement has not been made.
+- **The npm ghost is deleted** — `bin/moire.js` and the publish metadata are gone, and
+  `package.json` is now a private manifest that exists only to run `npm test`.
+- **Four defects were found by exercising `pending` and `compose` on a real fixture
+  before documenting them**, and none of them by the suite that was supposed to cover
+  them:
+  - *A textual `check` could clear a semantic finding.* Both `pending` and `report`
+    judged every finding against the pair's latest record whatever kind it was — and a
+    plain `check` never asks the semantic question, so with `check` on a per-write hook
+    the next keystroke erased the `BROKEN` finding `pending` exists to surface. Each
+    finding is now judged against the latest record of its own kind.
+  - *"Latest" was a coin flip inside a wall-clock second.* Two records with the same
+    timestamp were ordered by `check_id`, which is random hex. The log is append-only,
+    so arrival order is now the tiebreak everywhere a latest record is chosen; that is
+    also what un-flaked an existing suite case.
+  - *`compose` could speak from the peer's record.* The same finding id exists in both
+    sides' records with `self` and `peer` swapped — which is the whole verification
+    story — so when the peer had run the more recent check, `compose` rendered theirs:
+    `FROM`, `HEAD` and the arbiter inverted, a message naming its own receiver as the
+    sender. It now composes only from this worktree's records and refuses, with an
+    explanation, when the id exists only on the other side.
+  - *The arbiter crossed the message boundary untranslated.* A receiver would have read
+    `peer yields` while their own moire printed `self yields` for the same fact — the
+    exact ambiguity the message exists to remove. Also gone from `THE FACT`: a raw
+    `verdict: clean` printed under a `BROKEN` header, which read as a contradiction and
+    now reads `textually: clean - git reports no conflict`.
+
+  Two new cases in `tests/test_report.sh` pin the behavioural fixes with the sequences
+  that exposed them.
 
 ## What changed in 0.12
 
@@ -602,28 +771,33 @@ So this is a working instrument aimed at an open quantity, not a proven product.
 ```bash
 bash tests/test_oracle.sh    # 12 cases: conflict detection vs real `git merge`
 bash tests/test_install.sh   # 21 cases: install, hooks, path resolution, concurrency, object-store growth
-bash tests/test_report.sh    #  7 cases: finding identity, pair-state metrics, replay statelessness
+bash tests/test_report.sh    # 19 cases: finding identity, pair-state metrics, replay statelessness, pending and compose
 bash tests/test_setup.sh     # 14 cases: init-swarm, wire-client, settings-file handling
 bash tests/test_verify.sh    # 44 cases: the semantic path — new_breakage, renames, --link union, replay
 bash tests/negative_control.sh   # proves the five suites above can fail
 bash tests/benchmark_recall.sh   # 18 collision fixtures graded by CPython, not by moire
 ```
 
-**98 cases; measured 2026-08-12: 97 passed, 1 skipped, 0 failed.** The skip is a
+**110 cases; measured 2026-08-13: 109 passed, 1 skipped, 0 failed.** The skip is a
 `DeprecationWarning` check that only applies on Python 3.12+ and this machine runs
 3.8.2.
 
 `tests/negative_control.sh` is the answer to "a test suite that cannot fail is worse
 than none". It points `MOIRE_BIN` at a `#!/bin/sh; exit 0` stub and then at a path that
 does not exist, and asserts that **every** suite exits nonzero in both scenarios.
-Measured 2026-08-12: 10 of 10 checks went red as required, 0 wrongly stayed green.
+Measured 2026-08-13: 10 of 10 checks went red as required, 0 wrongly stayed green.
 
-⚠️ **`tests/test_setup.sh` is not contained.** Its `init-swarm` cases run with your real
-`$HOME`, and `init-swarm` places skills at `--skills user` by default, so running that
-suite copies this repository's `skills/` into `~/.claude/skills/` and
-`~/.agents/skills/`, moving anything already there to `*.moire-backup`. It is a
-test-suite defect, not a tool one, and it is written here rather than left for you to
-discover. Run that suite with `HOME=$(mktemp -d)` if you would rather it did not.
+**`tests/test_setup.sh` used to write into the invoker's real `$HOME`**, and this README
+said so rather than fixing it. Its `init-swarm` cases ran with no `--skills` override,
+and `--skills user` is the default, so the suite copied this repository's `skills/` into
+`~/.claude/skills/` and `~/.agents/skills/`, moving anything already there to
+`*.moire-backup`. Two cases had isolated `$HOME` themselves, which is exactly why the
+leak survived: per-case isolation only protects the cases someone remembered. The suite
+now isolates `$HOME` once at setup and restores it in the exit trap, so a case added
+later cannot reintroduce the leak by omission. Verified here 2026-08-13: the four real
+`SKILL.md` files under `~/.claude/skills/` and `~/.agents/skills/` hash identically
+before and after a full run of that suite, and no `*.moire-backup` directory was
+created.
 
 `test_oracle.sh` is the suite with the strongest ground truth: it performs a real `git
 merge` in a throwaway copy and compares moire's verdict against what git actually did.
@@ -683,7 +857,7 @@ The full map, with each source's verification status, is in
 bin/moire            the tool — a single file, Python 3.8, standard library only
 skills/              two Agent Skills: one for acting on a finding, one for
                      setting up parallel work
-tests/               98 cases across five suites, plus the negative control and
+tests/               110 cases across five suites, plus the negative control and
                      the recall benchmark
 tools/replay-corpus/ the Phase 1 measurement harness (stdlib only, not shipped)
 PHASE1-PREREGISTRATION.md   the decision rule, committed before any data
@@ -704,12 +878,13 @@ and which one is always stated:
 **1. Measured here, 2026-08-12, on an Apple M1 MacBook Pro** (`MacBookPro17,1`,
 macOS 15.7.3, Python 3.8.2, git 2.55.0): the [cost table](#cost) and its 21 ms
 process floor; the 62-of-63-files checker coverage; the zero loose objects over 20
-idle checks; the 98 test cases and their 97/1/0 outcome; the negative control's 10 of
-10; the object-store observations in [what
-observation writes](#what-observation-writes-and-where); both Clash reproductions. The
-recall benchmark's 9-of-11 and 4-of-11 scores with 0 of 7 false positives were measured
-on the same machine **2026-08-13**, after three fixtures were added for shapes the
-suite had never exercised. The
+idle checks; the object-store observations in [what
+observation writes](#what-observation-writes-and-where); both Clash reproductions. On
+the same machine **2026-08-13**: the 110 test cases and their 109/1/0 outcome, the
+negative control's 10 of 10, the `pending` and `compose` output in [from finding to
+conversation](#from-finding-to-conversation) and the two-worktree lab it was run in, and
+the recall benchmark's 9-of-11 and 4-of-11 scores with 0 of 7 false positives, the last
+of these after three fixtures were added for shapes the suite had never exercised. The
 cost table was taken under load averages of 10.19–11.44 on 8 cores and is published as
 a **ceiling**, not a figure.
 
