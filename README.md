@@ -312,7 +312,7 @@ For each peer worktree:
 
 The default checker is a small Python import resolver with no dependencies: it proves an import still resolves — both the module and the name it takes from it — not that its contract held. A function whose exported name is unchanged while its return type widens from `string` to `string | null` is invisible to it, and so is an argument added to a signature. For a statically-typed language, point `--checker` at a real type checker.
 
-It records an import of a module that is not in the tree as a finding, `os` and `numpy` included, and lets the subtraction throw those away: they are unresolvable in all three trees and cancel, while a module one agent deleted or `git mv`d is unresolvable only in the merge. Withholding those at detection time instead — which is what it used to do — made it blind to the case this tool exists for, one agent moving the door while the other builds a path to where it was. The consequence is that the per-tree counts on the clean line are large and mostly stdlib; they are an intermediate quantity, and only the difference between them is a judgement. `tests/benchmark_recall.sh` measures what that buys: **7 of 8** textually clean collisions whose breakage CPython confirms on the merged tree, against **2 of 8** before, with **0 of 7** clean merges reported as broken. The one it still misses is the changed signature.
+It records an import of a module that is not in the tree as a finding, `os` and `numpy` included, and lets the subtraction throw those away: they are unresolvable in all three trees and cancel, while a module one agent deleted or `git mv`d is unresolvable only in the merge. Withholding those at detection time instead — which is what it used to do — made it blind to the case this tool exists for, one agent moving the door while the other builds a path to where it was. The consequence is that the per-tree counts on the clean line are large and mostly stdlib; they are an intermediate quantity, and only the difference between them is a judgement. `tests/benchmark_recall.sh` measures what that buys: **9 of 11** textually clean collisions whose breakage CPython confirms on the merged tree, against **4 of 11** before, with **0 of 7** clean merges reported as broken. The two it still misses are a changed signature and an attribute removed from a module that still resolves — neither is a name that stopped resolving, and both are out of reach of an import resolver by construction rather than by quality. [What that score does and does not mean](#what-9-of-11-measures) is worth reading before quoting it.
 
 It **reads Python only**, and it says so rather than implying otherwise. When the merged tree contains no `.py` files there is nothing it can examine, so `verify` reports that instead of claiming the merge is fine:
 
@@ -565,7 +565,7 @@ So this is a working instrument aimed at an open quantity, not a proven product.
   headline failure this tool is about reported `semantic ok`. Absent modules are now
   findings, and the existing `broken(merged) − broken(self) − broken(peer)` subtraction
   removes the ambient ones — recall on the new
-  [recall benchmark](#tests) goes from 2 of 8 to 7 of 8 with no new false positive
+  [recall benchmark](#tests) goes from 4 of 11 to 9 of 11 with no new false positive
   there or on the pilot corpus pairs. Per-tree finding counts rise by one to two orders
   of magnitude as a result; the difference between them, which is the judgement, does
   not.
@@ -605,7 +605,7 @@ bash tests/test_report.sh    #  7 cases: finding identity, pair-state metrics, r
 bash tests/test_setup.sh     # 14 cases: init-swarm, wire-client, settings-file handling
 bash tests/test_verify.sh    # 44 cases: the semantic path — new_breakage, renames, --link union, replay
 bash tests/negative_control.sh   # proves the five suites above can fail
-bash tests/benchmark_recall.sh   # 15 collision fixtures graded by CPython, not by moire
+bash tests/benchmark_recall.sh   # 18 collision fixtures graded by CPython, not by moire
 ```
 
 **98 cases; measured 2026-08-12: 97 passed, 1 skipped, 0 failed.** The skip is a
@@ -635,17 +635,46 @@ weaker, and is stated here rather than glossed.
 
 `tests/benchmark_recall.sh` is the answer to that weakness, and it asks a different
 question from the suites: not whether the mechanism behaves as specified, but how much
-of a real collision it sees. Fifteen textually clean fixtures — a deleted module, a
-`git mv`, a package rename, a removed name, a changed signature, a name one side
-supplies for the other, a namespace package, and the third-party imports that must
-never fire — are graded
+of a real collision it sees. Eighteen textually clean fixtures — a deleted module, a
+`git mv`, a package rename, a removed name, a broken `__init__.py` re-export, a dotted
+submodule import, a changed signature, an attribute removed from a surviving module, a
+name one side supplies for the other, a namespace package, and the third-party imports
+that must never fire — are graded
 by materialising the same three trees and **importing every module in each with
 CPython**, then subtracting the interpreter's errors exactly as moire subtracts its
-own. Nothing in it consults moire's verdict. Measured 2026-08-12: **7 of 8** confirmed
-collisions caught and **0 of 7** clean merges reported, against **2 of 8** and 0 of 7
-for the previous checker (`git show febc36b:bin/moire`). The miss is the changed
-signature, which is not a name that stopped resolving and is out of reach of an import
-resolver by construction.
+own. Nothing in it consults moire's verdict. Measured 2026-08-13: **9 of 11** confirmed
+collisions caught and **0 of 7** clean merges reported, against **4 of 11** and 0 of 7
+for the previous checker (`git show febc36b:bin/moire`).
+
+### What 9 of 11 measures
+
+**It is a robustness score inside one category, not a recall measurement over the
+domain, and it should not be quoted as the second thing.**
+
+The literature that classifies *causes* of build-layer breakage names nine of them.
+An import-name resolver can reach exactly one — **Unavailable Symbol**, a reference to
+a declaration the other side deleted or renamed. The other eight (duplicated
+declaration, incompatible types, unimplemented interface method, changed signature,
+dependency-version skew, dependency-code mismatch, project rules) are out of reach of
+*any* implementation of this mechanism, not of this one. Add the behavioural layer —
+interference between branches that both compile — and it is one of twelve.
+
+So the eleven positives are **nine structural variants of a single category** plus two
+declared out-of-reach misses. The variants are where a naive resolver actually breaks —
+`git mv`, package rename, relative imports, re-export chains — so catching them is real
+signal about the implementation. It is not evidence about coverage of the problem.
+
+The mitigating half, which is equally measured: that one category is the **single
+largest cause** of build conflict in both corpora that count causes. da Silva, Borba &
+Pires ([*JSEP* 34(4):e2441, 2022](https://doi.org/10.1002/smr.2441)) found Unavailable
+Symbol to be **65.7%** of 239 conflict instances across 57,065 merge scenarios; Shen,
+Gulzar, He & Meng ([*TOSEM* 32(2):40, 2023](https://doi.org/10.1145/3546944)) found
+**99 of 107** inspected build conflicts reduce to edits that break def-use links — a
+name that stopped resolving. The checker targets the right category; it simply cannot
+claim the domain.
+
+The full map, with each source's verification status, is in
+`research/semantic-conflict-taxonomy.md`.
 
 ## Repository layout
 
@@ -676,9 +705,11 @@ and which one is always stated:
 macOS 15.7.3, Python 3.8.2, git 2.55.0): the [cost table](#cost) and its 21 ms
 process floor; the 62-of-63-files checker coverage; the zero loose objects over 20
 idle checks; the 98 test cases and their 97/1/0 outcome; the negative control's 10 of
-10; the recall benchmark's 7-of-8 and 2-of-8 scores with 0 of 7 false positives; the
-object-store observations in [what
+10; the object-store observations in [what
 observation writes](#what-observation-writes-and-where); both Clash reproductions. The
+recall benchmark's 9-of-11 and 4-of-11 scores with 0 of 7 false positives were measured
+on the same machine **2026-08-13**, after three fixtures were added for shapes the
+suite had never exercised. The
 cost table was taken under load averages of 10.19–11.44 on 8 cores and is published as
 a **ceiling**, not a figure.
 
@@ -704,6 +735,8 @@ was taken from the paper or report itself, and its denominator travels with it:
 | **3% / 5.4%** | of 6,045 real Java merges from 1,120 repositories **where both parents passed their tests**, git produced a clean merge that failed compilation or tests in 157 cases — 3% of all merges, 5.4% of textually clean ones. Human merges, not agent merges | Schesch, Featherman, Yang, Roberts & Ernst, ASE 2024, [arXiv:2410.09934](https://arxiv.org/pdf/2410.09934) |
 | **51% vs 3%** | in that same corpus git reported a textual conflict on 51% of merges and a silently-broken clean merge on 3%: textual conflicts were roughly 17× more frequent. `verify`'s event is the rarer, costlier one | same, Fig. 5 |
 | **9.3%** | recomputed from Brun et al.'s Figure 4: 133 of 1,428 textually clean merges failed to build or failed tests. Arithmetic below | Brun, Holmes, Ernst & Notkin, ESEC/FSE 2011 |
+| **65.7%** | share of 239 build-conflict *instances* that are Unavailable Symbol — the one category this checker can reach. Those instances came from 65 scenarios (0.11%) out of 57,065 merge scenarios in 451 Java projects, so the 65.7% is a share of causes, **not** a rate of occurrence | da Silva, Borba & Pires, *JSEP* 34(4):e2441, 2022, [DOI 10.1002/smr.2441](https://doi.org/10.1002/smr.2441) |
+| **99 of 107** | inspected build conflicts that reduce to co-applied edits breaking def-use links — a name that stopped resolving. 208 Java repos; 79 scenarios hit build conflicts against 15,886 that hit textual ones | Shen, Gulzar, He & Meng, *TOSEM* 32(2):40, 2023, [DOI 10.1145/3546944](https://doi.org/10.1145/3546944) |
 | **20% / 93%** | 20% of previously-safe relationships devolved into a conflict, and 93% of all conflicts developed *from* a previously-safe state — the published argument for continuous rather than one-shot checking | same, §4.4 |
 | **2.1–14.7% / 5.6–35%** | of clean merges across four projects, the build-failure range; of correct builds, the test-failure range. Do not collapse to a midpoint; neither paper isolates merge-*caused* from ambient failures | Kasi & Sarma, ICSE 2013 |
 | **3.33% / 71.48%** | ConE flagged 775 of 26,000 pull requests across 234 repositories; 554 of those 775 notifications were rated "Resolved" **by users** — not precision against ground truth | Maddila, Nagappan, Bird, Gousios & van Deursen, ACM TOSEM 31(2), 2022 |
