@@ -57,10 +57,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 MOIRE_BIN="${MOIRE_BIN:-$REPO_ROOT/bin/moire}"
 
-# Recall the current checker achieves. One of the eight positives is out of
-# reach of an import-name resolver by construction - a changed signature is not
-# a name that stopped resolving - so this is 7 and not 8.
-RECALL_FLOOR=7
+# Recall the current checker achieves. Two of the eleven positives are out of
+# reach of an import-name resolver by construction - a changed signature and
+# an attribute removed from a still-resolving module are not names that
+# stopped resolving - so this is 9 and not 11.
+RECALL_FLOOR=9
 
 TMPDIR_ROOT=""
 GIT_PROG=""
@@ -367,6 +368,75 @@ case_relative_import_deleted() {
     git_in "$repo" checkout -q self >/dev/null 2>&1
 }
 
+# P9: a re-export chain broken through __init__.py. Self imports the NAME at
+# the package level (`from pkg import helper`), which resolves through
+# `pkg/__init__.py`'s own `from .util import helper`; peer removes that
+# re-export line, leaving util.py untouched, and stops relying on it itself.
+# Common in real Python packages, and no existing fixture routes resolution
+# through an __init__.py re-export rather than a direct module import.
+case_reexport_removed() {
+    local repo="$1"
+    mkdir -p "$repo/pkg"
+    printf 'def helper():\n    return 1\n' > "$repo/pkg/util.py"
+    printf 'from .util import helper\n' > "$repo/pkg/__init__.py"
+    printf 'from pkg import helper\n\nVALUE = helper()\n' > "$repo/pkg/main.py"
+    commit_all "$repo" base
+    git_in "$repo" branch peer >/dev/null 2>&1
+    git_in "$repo" checkout -q -b self >/dev/null 2>&1
+    printf 'from pkg import helper\n\nRESULT = helper()\n' > "$repo/pkg/newfeature.py"
+    commit_all "$repo" "self: new feature that uses the pkg-level re-export"
+    git_in "$repo" checkout -q peer >/dev/null 2>&1
+    printf '' > "$repo/pkg/__init__.py"
+    printf 'VALUE = 1\n' > "$repo/pkg/main.py"
+    commit_all "$repo" "peer: drop the re-export and its last caller"
+    git_in "$repo" checkout -q self >/dev/null 2>&1
+}
+
+# P10: the dotted submodule form, `import pkg.util`, made unavailable. No
+# existing fixture uses this form - P4 uses bare `import util`, and every
+# other deletion fixture reaches the module through `from ... import`, which
+# walks a different branch of the Import/ImportFrom handling than a bare
+# `import pkg.util` does.
+case_dotted_submodule_deleted() {
+    local repo="$1"
+    mkdir -p "$repo/pkg"
+    : > "$repo/pkg/__init__.py"
+    printf 'def helper():\n    return 1\n' > "$repo/pkg/util.py"
+    printf 'import pkg.util\n\nVALUE = pkg.util.helper()\n' > "$repo/pkg/main.py"
+    commit_all "$repo" base
+    git_in "$repo" branch peer >/dev/null 2>&1
+    git_in "$repo" checkout -q -b self >/dev/null 2>&1
+    printf 'import pkg.util\n\nRESULT = pkg.util.helper()\n' > "$repo/pkg/newfeature.py"
+    commit_all "$repo" "self: new feature that imports the dotted submodule"
+    git_in "$repo" checkout -q peer >/dev/null 2>&1
+    git_in "$repo" rm -q "pkg/util.py" >/dev/null 2>&1
+    printf 'VALUE = 1\n' > "$repo/pkg/main.py"
+    commit_all "$repo" "peer: drop util and its last caller"
+    git_in "$repo" checkout -q self >/dev/null 2>&1
+}
+
+# P11: the import still resolves - `lib` is still a module in the tree - but
+# the attribute accessed on it is gone. Out of reach of an import-name
+# resolver for the same reason P7 is: the checker's contract for `import M`
+# is only that M is a module here, and resolving `M.attr` is attribute-level
+# resolution, a materially larger mechanism than this checker implements.
+# Here so the score says the limit out loud instead of it staying silent.
+case_attribute_after_import() {
+    local repo="$1"
+    printf 'def helper():\n    return 1\n' > "$repo/lib.py"
+    printf 'import lib\n\nVALUE = lib.helper()\n' > "$repo/main.py"
+    commit_all "$repo" base
+    git_in "$repo" branch peer >/dev/null 2>&1
+    git_in "$repo" checkout -q -b self >/dev/null 2>&1
+    printf 'import lib\n\nRESULT = lib.helper()\n' > "$repo/newfeature.py"
+    commit_all "$repo" "self: new feature that calls lib.helper()"
+    git_in "$repo" checkout -q peer >/dev/null 2>&1
+    printf 'VALUE = 1\n' > "$repo/lib.py"
+    printf 'VALUE = 1\n' > "$repo/main.py"
+    commit_all "$repo" "peer: remove helper from lib and stop calling it"
+    git_in "$repo" checkout -q self >/dev/null 2>&1
+}
+
 # N1: both sides add files importing modules that are not in the tree and
 # never will be. Unresolvable in all three trees, so it must cancel - this is
 # the case that decides whether recording absent modules costs false positives.
@@ -623,6 +693,9 @@ main() {
     run_case positive name-renamed              case_name_renamed
     run_case positive signature-changed         case_signature_changed
     run_case positive relative-import-deleted   case_relative_import_deleted
+    run_case positive reexport-removed          case_reexport_removed
+    run_case positive dotted-submodule-deleted  case_dotted_submodule_deleted
+    run_case positive attribute-after-import    case_attribute_after_import
     run_case negative thirdparty-both-sides     case_thirdparty_both_sides
     run_case negative thirdparty-one-side       case_thirdparty_one_side
     run_case negative rename-carries-breakage   case_rename_carries_breakage
