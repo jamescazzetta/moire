@@ -3083,36 +3083,55 @@ def _finding_lifecycle(records):
     accumulated across calls or persisted. Used by `report`'s findings
     section (first/last/times_seen/live/kind).
     """
+    # Ties on `ts` are real (two checks in the same wall-clock second) and
+    # `check_id` is random hex, so (ts, check_id) breaks them by coin flip.
+    # The log is append-only, so a record's position IS its arrival order;
+    # the enumerate index below is the deterministic tiebreak.
     finding_records = {}
     pair_records = {}
-    for r in records:
+    for i, r in enumerate(records):
         pk = _pair_key(r)
         if pk:
-            pair_records.setdefault(pk, []).append(r)
+            pair_records.setdefault(pk, []).append((i, r))
         fid = r.get("finding_id")
         if fid:
-            finding_records.setdefault(fid, []).append(r)
+            finding_records.setdefault(fid, []).append((i, r))
 
-    # The most recent record observed for each worktree pair, regardless of
-    # which finding_id (or none) it carries - this is what answers "is a
-    # given finding still live", by comparing its id against whatever the
-    # pair's latest check actually saw.
+    # The most recent record observed for each worktree pair - and, apart,
+    # the most recent one that PERFORMED a semantic check outside a textual
+    # conflict. A finding is judged live against the latest record OF ITS
+    # OWN KIND: every record answers the textual question, but a plain
+    # `check` never asks the semantic one, so it must not be able to clear
+    # a semantic finding it never re-examined. (A conflict record can carry
+    # semantic breakage too, but its finding_id keys on conflict_paths, so
+    # it can neither confirm nor clear a semantic id - it is not semantic-
+    # informative here, and the semantic finding simply keeps its age.)
     latest_by_pair = {}
-    for pk, rs in pair_records.items():
-        latest_by_pair[pk] = max(rs, key=lambda r: (r.get("ts") or "", r.get("check_id") or ""))
+    latest_sem_by_pair = {}
+    for pk, irs in pair_records.items():
+        latest_by_pair[pk] = max(irs, key=lambda ir: (ir[1].get("ts") or "", ir[0]))[1]
+        sem = [ir for ir in irs
+               if (ir[1].get("semantic") or {}).get("performed")
+               and ir[1].get("verdict") != "conflict"]
+        if sem:
+            latest_sem_by_pair[pk] = max(sem, key=lambda ir: (ir[1].get("ts") or "", ir[0]))[1]
 
     meta = {}
-    for fid, rs in finding_records.items():
-        rs_sorted = sorted(rs, key=lambda r: (r.get("ts") or "", r.get("check_id") or ""))
+    for fid, irs in finding_records.items():
+        rs_sorted = [r for _, r in sorted(irs, key=lambda ir: (ir[1].get("ts") or "", ir[0]))]
         first_rec, last_rec = rs_sorted[0], rs_sorted[-1]
-        latest_pair_rec = latest_by_pair.get(_pair_key(last_rec))
+        pk = _pair_key(last_rec)
+        if _finding_kind(last_rec) == "semantic":
+            latest_pair_rec = latest_sem_by_pair.get(pk)
+        else:
+            latest_pair_rec = latest_by_pair.get(pk)
         live = bool(latest_pair_rec is not None and latest_pair_rec.get("finding_id") == fid)
 
         meta[fid] = {
             "finding_id": fid,
             "first_seen": first_rec.get("ts"),
             "last_seen": last_rec.get("ts"),
-            "times_seen": len(rs),
+            "times_seen": len(rs_sorted),
             "live": live,
             "kind": _finding_kind(last_rec),
         }
@@ -3205,11 +3224,13 @@ def cmd_report(git, argv):
 
     # --- cleared vs outstanding -------------------------------------------
     # `live` (computed by _finding_lifecycle) already answers exactly this:
-    # a finding is outstanding when it is still what the latest record for
-    # its pair produces, cleared when a later record for that same pair
-    # stopped producing it. Reusing `live` rather than re-deriving keeps this
-    # in lockstep with the "findings (... live=yes/no)" section below - the
-    # two can never disagree, because they read the same field.
+    # a finding is outstanding while the latest SAME-KIND record for its
+    # pair still produces it, cleared when a later record of that kind
+    # stopped producing it - "same kind" because a plain `check` never asks
+    # the semantic question and so can neither confirm nor clear a semantic
+    # finding. Reusing `live` rather than re-deriving keeps this in lockstep
+    # with the "findings (... live=yes/no)" section below - the two can
+    # never disagree, because they read the same field.
     #
     # "Cleared" is deliberately not "resolved": the pair-state stopped
     # producing the finding for any reason - one side landed, rebased,
@@ -3297,8 +3318,9 @@ def cmd_report(git, argv):
                          % (100.0 * semantic_rate, semantic_states))
     sys.stdout.write("distinct findings                 : %d textual, %d semantic\n"
                      % (distinct_textual, distinct_semantic))
-    sys.stdout.write("%-34s: %d cleared, %d outstanding   (cleared = the pair-state stopped\n"
-                     "                                    producing it; cause is not implied)\n"
+    sys.stdout.write("%-34s: %d cleared, %d outstanding   (cleared = a later check of the\n"
+                     "                                    same kind no longer reports it;\n"
+                     "                                    cause is not implied)\n"
                      % ("findings cleared / outstanding", distinct_cleared, distinct_outstanding))
     sys.stdout.write("raw observations                  : %d pair records, %d conflicts, "
                      "%d semantic, %d breakage\n"
@@ -3402,11 +3424,12 @@ def _finding_facts(rec):
 def cmd_pending(git, argv):
     """What findings exist right now between me and each peer, per the log
     alone - what an agent consults at session start and before declaring
-    work done. Groups THIS worktree's own logged records by peer, takes the
-    latest one per peer, and shows it only if that latest record still
-    carries a finding_id: a finding that appeared in an earlier record but
-    is absent from the latest one for the same pair is cleared, and cleared
-    findings are not shown here (only counted, by `report`).
+    work done. Groups THIS worktree's own logged records by peer and judges
+    each finding against the latest record OF ITS OWN KIND: any record
+    answers the textual question, but only a record that performed a
+    semantic check can confirm or clear a semantic finding. A finding absent
+    from that latest same-kind record is cleared, and cleared findings are
+    not shown here (only counted, by `report`).
 
     Read-only by construction: nothing below ever opens a log file for
     writing, touches the snapshot cache, or reads a peer worktree's files -
@@ -3438,20 +3461,38 @@ def cmd_pending(git, argv):
     # I know about each peer", not "what does the shared log know about any
     # pair regardless of who ran the check", which is `report`'s question
     # (it uses the unordered _pair_key instead, on purpose - see there).
+    # The enumerate index is the tiebreak for same-second timestamps: the
+    # log is append-only, so position is arrival order, where check_id is
+    # random hex and would break the tie by coin flip.
     by_peer = {}
-    for r in records:
+    for i, r in enumerate(records):
         if (r.get("self") or {}).get("worktree") != top:
             continue
         p = (r.get("peer") or {}).get("worktree")
         if not p:
             continue
-        by_peer.setdefault(p, []).append(r)
+        by_peer.setdefault(p, []).append((i, r))
 
+    # Per peer, judge each KIND of finding against the latest record that
+    # could actually answer it. Every record answers the textual question; a
+    # plain `check` never asks the semantic one, so with `check` on a
+    # post-write hook a naive "latest record wins" would erase a BROKEN
+    # finding on the next keystroke - the one finding most worth surfacing
+    # here. A semantic finding is therefore judged only against the latest
+    # record that performed a semantic check outside a textual conflict, and
+    # until one exists it stays outstanding, wearing its age.
     outstanding = []
-    for _peer_wt, rs in by_peer.items():
-        latest = max(rs, key=lambda r: (r.get("ts") or "", r.get("check_id") or ""))
-        if latest.get("finding_id"):
-            outstanding.append(latest)
+    for _peer_wt, irs in by_peer.items():
+        latest_any = max(irs, key=lambda ir: (ir[1].get("ts") or "", ir[0]))[1]
+        if latest_any.get("finding_id") and _finding_kind(latest_any) == "textual":
+            outstanding.append(latest_any)
+        sem = [ir for ir in irs
+               if (ir[1].get("semantic") or {}).get("performed")
+               and ir[1].get("verdict") != "conflict"]
+        if sem:
+            latest_sem = max(sem, key=lambda ir: (ir[1].get("ts") or "", ir[0]))[1]
+            if latest_sem.get("finding_id"):
+                outstanding.append(latest_sem)
     outstanding.sort(key=lambda r: ((r.get("peer") or {}).get("worktree") or "",
                                     r.get("ts") or ""))
 
@@ -3547,10 +3588,24 @@ def cmd_compose(git, argv):
         sys.stderr.write("moire: not inside a git worktree\n")
         return 2
 
+    top = git.out(["rev-parse", "--show-toplevel"], cwd=cwd)
+    if not top:
+        sys.stderr.write("moire: not inside a git worktree\n")
+        return 2
+    top = os.path.realpath(top)
+
     ld = log_dir(cd)
     all_records, _checks = _read_log_records(ld)
-    matches = [r for r in all_records
-              if r.get("v") == RECORD_VERSION and r.get("finding_id") == fid]
+    # Only records THIS worktree logged as "self" qualify. The same finding
+    # id exists in the peer's records too - that symmetry is the protocol's
+    # whole verification story - but a peer-side record has self and peer
+    # SWAPPED, so rendering one from here would invert FROM, HEAD, and the
+    # sender/receiver translation below: the message would name the receiver
+    # as its own sender. Verified live before this filter existed.
+    mine = [(i, r) for i, r in enumerate(all_records)
+            if r.get("v") == RECORD_VERSION
+            and (r.get("self") or {}).get("worktree") == top]
+    matches = [(i, r) for i, r in mine if r.get("finding_id") == fid]
     if not matches:
         # Refused before any write - same discipline as every other command
         # here, and there IS nothing this command ever writes. `moire
@@ -3559,6 +3614,14 @@ def cmd_compose(git, argv):
         # can never be looked up here. That is worth saying explicitly: a
         # caller who copied an id out of a `replay` run needs to know why it
         # is refused, not just that it is unknown.
+        theirs = any(r.get("v") == RECORD_VERSION and r.get("finding_id") == fid
+                     for r in all_records)
+        if theirs:
+            _refuse("compose",
+                   "finding %r was recorded from another worktree's runs, not "
+                   "this one's. A message is composed from the sender's own "
+                   "record - run 'moire check' or 'moire verify' here first, "
+                   "which will log the same finding id from this side." % fid)
         _refuse("compose",
                "no finding %r in the log. 'moire replay' writes no log, so a "
                "finding it reports can never be composed here - only "
@@ -3566,7 +3629,8 @@ def cmd_compose(git, argv):
                "also stops appearing once its pair-state clears - run "
                "'moire pending' to see what is outstanding now." % fid)
 
-    rec = max(matches, key=lambda r: (r.get("ts") or "", r.get("check_id") or ""))
+    # Append-order index as the same-second tiebreak, same as pending.
+    rec = max(matches, key=lambda ir: (ir[1].get("ts") or "", ir[0]))[1]
     kind, items, meaning = _finding_facts(rec)
     items = _sorted_findings(items)
     self_ = rec.get("self") or {}
@@ -3585,7 +3649,12 @@ def cmd_compose(git, argv):
             "peer": {"worktree": peer.get("worktree"), "branch": peer.get("branch")},
             "fact": {"verdict": rec.get("verdict"), "items": items,
                     "merged_tree": merged_tree, "meaning": meaning},
-            "arbiter": arb,
+            # Translated for the receiver: the record's "self"/"peer" labels
+            # are relative to whoever ran the check, and this message's
+            # receiver IS that record's peer. "sender"/"receiver" cannot be
+            # read from the wrong side.
+            "arbiter": ({"yields": ("sender" if arb["yield"] == "self" else "receiver"),
+                         "reason": arb["reason"]} if arb else None),
             "sender_action": action,
             "verify_command": verify_cmd,
         }, indent=2) + "\n")
@@ -3605,10 +3674,13 @@ def cmd_compose(git, argv):
     lines.append("")
     lines.append("THE FACT")
     lines.append("  %s" % ("CONFLICT" if kind == "textual" else "BROKEN"))
-    lines.append("  verdict: %s" % rec.get("verdict"))
     if kind == "textual":
         lines.append("  contested path(s): %d" % len(items))
     else:
+        # The record's raw verdict field says "clean" here - that is the
+        # TEXTUAL verdict, and dumping it unlabelled under a BROKEN header
+        # reads as a contradiction to the receiver. Say what it means.
+        lines.append("  textually: clean - git reports no conflict")
         lines.append("  breakage(s): %d%s" % (len(items),
                      (" (merged tree %s)" % merged_tree) if merged_tree else ""))
     for it in items:
@@ -3616,10 +3688,19 @@ def cmd_compose(git, argv):
     lines.append("  meaning: %s" % meaning)
     lines.append("")
     if arb:
+        # The record's arbiter labels are relative to whoever ran the check:
+        # its "peer" is this message's RECEIVER. Handing those labels over
+        # untranslated means the receiver reads "peer yields" while their own
+        # moire prints "self yields" for the same fact - the exact ambiguity
+        # this message exists to remove. Translate to sender/receiver and say
+        # the labels flip.
+        who = ("the sender (this side)" if arb["yield"] == "self"
+               else "the receiver (your side)")
         lines.append("ARBITER")
-        lines.append("  %s yields (%s)" % (arb["yield"], arb["reason"]))
-        lines.append("  computed from facts observable to both of us; your moire will "
-                     "say the same")
+        lines.append("  recommendation: %s yields" % who)
+        lines.append("  reason: %s" % arb["reason"])
+        lines.append("  computed from facts observable to both of us; your moire "
+                     "reports the same recommendation - its 'self' is you")
         lines.append("")
     lines.append("SENDER'S ACTION")
     lines.append("  %s" % (ACTION_STATEMENTS[action] if action else

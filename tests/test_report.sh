@@ -1003,6 +1003,116 @@ test_017_report_cleared_outstanding_transition() {
     fi
 }
 
+# A plain `check` never runs the semantic checker, so it must not be able to
+# clear a semantic finding it never re-examined. With `check` wired to a
+# post-write hook, the naive "latest record wins" rule would erase a BROKEN
+# finding from `pending` on the next keystroke - the one finding most worth
+# surfacing there. Found live before this case existed: verify reported
+# BROKEN, a routine check followed, and pending showed nothing.
+test_018_textual_check_cannot_clear_semantic_finding() {
+    local test_dir=$(mktemp -d)
+    trap "rm -rf '$test_dir'" RETURN
+
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    setup_semantic_breakage_repo "$repo"
+
+    if ! git_in "$repo" worktree add "$test_dir/peer" branch_b >/dev/null 2>&1; then
+        report_result 18 "textual-check-cannot-clear-semantic-finding" "SKIP" "could not create peer worktree"
+        return
+    fi
+
+    local vj fid
+    vj=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" verify --json 2>/dev/null)
+    if ! fid=$(json_get "$vj" "finding_id" 0) || [ -z "$fid" ] || [ "$fid" = "null" ]; then
+        report_result 18 "textual-check-cannot-clear-semantic-finding" "SKIP" "verify produced no semantic finding"
+        return
+    fi
+
+    # The textual check that must NOT clear it (the pair merges cleanly, so
+    # this records a clean textual verdict for the same pair).
+    if ! (cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" check) >/dev/null 2>&1; then
+        report_result 18 "textual-check-cannot-clear-semantic-finding" "FAIL" "moire check failed"
+        return
+    fi
+
+    local pout still_shown rj outstanding
+    pout=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" pending 2>&1)
+    echo "$pout" | grep -q "$fid" && still_shown=yes || still_shown=no
+    rj=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" report --json 2>/dev/null)
+    outstanding=$(json_get "$rj" "findings_outstanding" 0)
+
+    # And a later VERIFY on the same, unchanged pair keeps reporting the same
+    # finding id - live stays yes through its own kind, never despite it.
+    local vj2 fid2
+    vj2=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" verify --json 2>/dev/null)
+    fid2=$(json_get "$vj2" "finding_id" 0)
+
+    if [ "$still_shown" = "yes" ] && [ "$outstanding" = "1" ] && [ "$fid2" = "$fid" ]; then
+        report_result 18 "textual-check-cannot-clear-semantic-finding" "PASS"
+    else
+        report_result 18 "textual-check-cannot-clear-semantic-finding" "FAIL" \
+            "pending_still_shows=$still_shown outstanding=$outstanding fid1=$fid fid2=$fid2"
+    fi
+}
+
+# The same finding id exists in the peer's records with self and peer
+# swapped - that symmetry is the protocol's verification story. compose must
+# therefore never render a peer-side record: FROM, HEAD and the
+# sender/receiver arbiter translation would all be inverted, and the message
+# would name its receiver as its own sender. Found live: after the peer ran
+# verify more recently than self, compose picked the peer's record and
+# reported the arbiter from the wrong side.
+test_019_compose_never_renders_a_peer_side_record() {
+    local test_dir=$(mktemp -d)
+    trap "rm -rf '$test_dir'" RETURN
+
+    local repo="$test_dir/repo"
+    mkdir -p "$repo"
+    setup_semantic_breakage_repo "$repo"
+
+    if ! git_in "$repo" worktree add "$test_dir/peer" branch_b >/dev/null 2>&1; then
+        report_result 19 "compose-never-renders-a-peer-side-record" "SKIP" "could not create peer worktree"
+        return
+    fi
+
+    # Only the PEER runs verify, so the only record carrying the id is
+    # peer-side relative to $repo.
+    local vj fid
+    vj=$(cd "$test_dir/peer" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" verify --json 2>/dev/null)
+    if ! fid=$(json_get "$vj" "finding_id" 0) || [ -z "$fid" ] || [ "$fid" = "null" ]; then
+        report_result 19 "compose-never-renders-a-peer-side-record" "SKIP" "peer verify produced no finding"
+        return
+    fi
+
+    local out1 rc1 refuses
+    out1=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" compose "$fid" 2>&1)
+    rc1=$?
+    echo "$out1" | grep -q "another worktree's runs" && refuses=yes || refuses=no
+
+    # After this side records the same fact itself, compose works and speaks
+    # from THIS side: the FROM worktree is $repo, not the peer.
+    (cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" verify) >/dev/null 2>&1
+    local out2 rc2 from_ok
+    out2=$(cd "$repo" && MOIRE_GIT="$GIT_PROG" "$MOIRE_BIN" compose "$fid" --json 2>/dev/null)
+    rc2=$?
+    from_ok=no
+    if [ $rc2 -eq 0 ]; then
+        echo "$out2" | python3 -c '
+import json, sys, os
+d = json.load(sys.stdin)
+sys.exit(0 if os.path.realpath(d["from"]["worktree"]) == os.path.realpath(sys.argv[1]) else 1)
+' "$repo" && from_ok=yes
+    fi
+
+    if [ "$rc1" -eq 2 ] && [ "$refuses" = "yes" ] && [ "$from_ok" = "yes" ]; then
+        report_result 19 "compose-never-renders-a-peer-side-record" "PASS"
+    else
+        report_result 19 "compose-never-renders-a-peer-side-record" "FAIL" \
+            "refusal_rc=$rc1 refuses=$refuses from_ok=$from_ok"
+    fi
+}
+
 # === MAIN ===
 
 main() {
@@ -1041,6 +1151,8 @@ main() {
     test_015_compose_unknown_id_exit2
     test_016_pending_compose_write_nothing
     test_017_report_cleared_outstanding_transition
+    test_018_textual_check_cannot_clear_semantic_finding
+    test_019_compose_never_renders_a_peer_side_record
 
     # Print summary
     local total=$((PASSED + FAILED + SKIPPED))
