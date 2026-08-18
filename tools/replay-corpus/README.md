@@ -89,7 +89,7 @@ Tier 2 replaces the checker:
 python3 replay_corpus.py pairs --tier typescript --sample 100 --out ts-pairs.jsonl
 python3 replay_corpus.py run --pairs ts-pairs.jsonl --out ts-results.jsonl \
     --replay-timeout 1800 \
-    --checker 'npm ci --ignore-scripts --no-audit --no-fund >/dev/null 2>&1 && ./node_modules/.bin/tsc --noEmit | sed -E "s/\([0-9]+,[0-9]+\)//"'
+    --checker 'npm ci --ignore-scripts --no-audit --no-fund >/dev/null 2>&1 && ./node_modules/.bin/tsc --noEmit | sed -E -e "s/\([0-9]+,[0-9]+\)//" -e "s#$(pwd -P)#.#g" -e "s#$(pwd)#.#g"'
 ```
 
 The install is **inside the checker command** on purpose. `moire replay` runs
@@ -105,7 +105,15 @@ identity: the same error at a shifted line number must cancel in the
 subtraction, or every insertion above a pre-existing error would read as new
 breakage.
 
-Three details of that command are load-bearing, not style. `--ignore-scripts`,
+Four details of that command are load-bearing, not style. The two `pwd`
+substitutions, because `tsc` embeds the *absolute path* of the materialised
+tree in some message bodies — `TS6142: Module './x' was resolved to
+'/private/var/…/T/tmp…/x.tsx'` — and an absolute temp path differs per tree
+and can never cancel; observed in the 18 August smoke run as 23 false
+breakages on one pair. The command runs with its working directory set to
+each tree, so `$(pwd -P)` at run time *is* that tree's root (both the
+physical and logical forms, because macOS reports the temp dir under
+`/private/var` while the logical path says `/var`). `--ignore-scripts`,
 because this replays the lockfiles of hundreds of repositories nobody here has
 read, and an install that cannot run lifecycle scripts cannot run their code.
 `./node_modules/.bin/tsc` rather than `npx tsc`, per moire's own checker
@@ -118,12 +126,25 @@ only in the merged tree survives it — which is exactly the pre-registration's
 "dependency-level new breakage in its own category", and the audit classifies
 it there.
 
-A pair on which `tsc` could not run at all must not count as evaluated-clean,
-so `run` prechecks tier-2 eligibility from the fetched heads before replaying:
-a pair is eligible when either head carries a root `tsconfig.json` or declares
-`typescript` in its dependencies. Ineligible pairs stop on the
-`not_checker_eligible` rung — the external-checker equivalent of the builtin
-checker's `performed: false`.
+A pair on which the checker could not actually run must not count as
+evaluated-clean, so `run` checks tier-2 eligibility from the fetched heads.
+An ineligible pair is still replayed — *without* the checker — because the
+textual verdict costs nothing and feeds the calibration gate, and the
+pre-registered ladder puts "textually clean" before "checker-eligible"; only
+a pair that would otherwise count as evaluated is reclassified to
+`not_checker_eligible`. **Both** heads must carry a root `package-lock.json` (`npm
+ci` refuses to run without one — a yarn- or pnpm-managed repository fails the
+install identically in all three trees, the sentinel cancels, and the pair
+would count as evaluated-clean with nothing measured; observed on
+elastic/kibana and OneKeyHQ/app-monorepo) and a root `tsconfig.json` or a
+declared `typescript` dependency. Both heads, not either: a single parent
+whose install fails leaves the subtraction without a subtrahend and biases
+the result *toward* false breakage (observed on ultracite: `self` failed its
+install and 23 artifact findings survived a subtraction that peer alone could
+not cancel). Ineligible pairs stop on the `not_checker_eligible` rung — the
+external-checker equivalent of the builtin checker's `performed: false`. The
+tier-2 population is therefore *npm-lockfile TypeScript repositories*, and
+the published scope says so.
 
 Once `cache/` is populated the only network the harness needs is git itself,
 so the fetch stages can be run somewhere with access and the cache carried to

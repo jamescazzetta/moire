@@ -467,10 +467,21 @@ def fetch_pr_head(repo_dir, number, timeout):
 
 
 def _ts_eligible(repo_dir, ref):
-    """Can `tsc --noEmit` mean anything on this head? True if the tree has a
-    root tsconfig.json, or package.json declares typescript in dependencies
-    or devDependencies. Read via git cat-file from the bare clone - nothing
-    is checked out to answer this."""
+    """Can the tier-2 checker command actually run on this head?
+
+    -> (eligible, reason). Two requirements, both read via git cat-file from
+    the bare clone (nothing is checked out to answer this):
+
+    - a root package-lock.json, because `npm ci` refuses to run without one.
+      A yarn- or pnpm-managed repository fails the install identically in
+      self, peer and merged, the sentinel cancels in the subtraction, and
+      the pair would count as evaluated-clean with nothing measured -
+      observed on elastic/kibana and OneKeyHQ/app-monorepo in the 18 August
+      smoke run. Narrower population, stated in the published scope, is
+      strictly better than a silently inflated denominator.
+    - a root tsconfig.json, or typescript declared in (dev)dependencies,
+      because a tree without tsc cannot be type-checked at all.
+    """
     def _cat(path):
         try:
             pr = subprocess.Popen(["git", "-C", repo_dir, "cat-file", "-p",
@@ -480,19 +491,21 @@ def _ts_eligible(repo_dir, ref):
             return o if pr.returncode == 0 else None
         except Exception:
             return None
+    if _cat("package-lock.json") is None:
+        return (False, "no package-lock.json (npm ci cannot run)")
     if _cat("tsconfig.json") is not None:
-        return True
+        return (True, None)
     pkg = _cat("package.json")
     if pkg is None:
-        return False
+        return (False, "no package.json")
     try:
         d = json.loads(pkg.decode("utf-8", "replace"))
     except Exception:
-        return False
+        return (False, "unparsable package.json")
     for k in ("dependencies", "devDependencies"):
         if "typescript" in (d.get(k) or {}):
-            return True
-    return False
+            return (True, None)
+    return (False, "no tsconfig.json and no typescript dependency")
 
 
 def cmd_run(args):
@@ -602,17 +615,29 @@ def cmd_run(args):
         # blindspot class the builtin checker's `performed` flag closed;
         # this is the external-checker equivalent. Eligible = either head
         # carries a tsconfig.json or declares typescript in (dev)deps.
+        # Tier-2 eligibility does NOT skip the replay: the textual verdict
+        # costs no checker and feeds the calibration gate, and the
+        # pre-registered ladder puts "textually clean" BEFORE
+        # "checker-eligible". An ineligible pair is replayed without the
+        # checker, keeps its textual verdict, and only a pair that would
+        # otherwise count as evaluated is reclassified to the
+        # not_checker_eligible rung below. (First smoke run got this wrong:
+        # llmgateway stopped at eligibility and its textual conflict
+        # vanished from calibration.)
+        ineligible_reason = None
         if args.checker and (p.get("tier") == "typescript"):
-            if not (_ts_eligible(repo_dir, ref_a) or _ts_eligible(repo_dir, ref_b)):
-                rec["stage"] = "not_checker_eligible"
-                rec["error"] = "neither head carries tsconfig.json or a typescript dependency"
-                append_jsonl(out, rec)
-                log("[%d] %s #%s+#%s  not_checker_eligible (no typescript)" %
-                    (n, p["repo"], p["a"], p["b"]))
-                continue
+            # BOTH heads must be able to run the checker: a parent tree whose
+            # install fails leaves the subtraction without a subtrahend and
+            # biases the result TOWARD false breakage (observed: ultracite's
+            # self tree failed its install and 23 artifact findings survived
+            # the subtraction that peer alone could not cancel).
+            ok_a, why_a = _ts_eligible(repo_dir, ref_a)
+            ok_b, why_b = _ts_eligible(repo_dir, ref_b)
+            if not (ok_a and ok_b):
+                ineligible_reason = "self: %s; peer: %s" % (why_a or "ok", why_b or "ok")
 
         cmd = [sys.executable, moire, "replay", ref_a, ref_b, "--json"]
-        if args.checker:
+        if args.checker and not ineligible_reason:
             cmd += ["--checker", args.checker]
         try:
             proc = subprocess.Popen(cmd, cwd=repo_dir, stdout=subprocess.PIPE,
@@ -650,6 +675,14 @@ def cmd_run(args):
 
         rec["replay"] = record
         rec["stage"] = classify_stage(record)
+        if ineligible_reason and rec["stage"] == "evaluated":
+            # The replay ran without the tier's checker (see above), so a
+            # clean verdict here says only "textually clean" - the semantic
+            # question was never asked. Without this override, a TS repo
+            # that happens to contain .py files would count as evaluated on
+            # the strength of the BUILTIN checker reading those.
+            rec["stage"] = "not_checker_eligible"
+            rec["error"] = ineligible_reason
         append_jsonl(out, rec)
         sem = record.get("semantic") or {}
         log("[%d] %s #%s+#%s  %s%s" %
