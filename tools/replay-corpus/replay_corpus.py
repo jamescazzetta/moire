@@ -466,6 +466,35 @@ def fetch_pr_head(repo_dir, number, timeout):
     return ref, None
 
 
+def _ts_eligible(repo_dir, ref):
+    """Can `tsc --noEmit` mean anything on this head? True if the tree has a
+    root tsconfig.json, or package.json declares typescript in dependencies
+    or devDependencies. Read via git cat-file from the bare clone - nothing
+    is checked out to answer this."""
+    def _cat(path):
+        try:
+            pr = subprocess.Popen(["git", "-C", repo_dir, "cat-file", "-p",
+                                   "%s:%s" % (ref, path)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            o, _ = pr.communicate(timeout=30)
+            return o if pr.returncode == 0 else None
+        except Exception:
+            return None
+    if _cat("tsconfig.json") is not None:
+        return True
+    pkg = _cat("package.json")
+    if pkg is None:
+        return False
+    try:
+        d = json.loads(pkg.decode("utf-8", "replace"))
+    except Exception:
+        return False
+    for k in ("dependencies", "devDependencies"):
+        if "typescript" in (d.get(k) or {}):
+            return True
+    return False
+
+
 def cmd_run(args):
     pairs = read_jsonl(os.path.join(args.cache, args.pairs))
     if not pairs:
@@ -482,6 +511,44 @@ def cmd_run(args):
     if not os.path.exists(moire):
         log("moire binary not found at %s (use --moire)" % moire)
         return 1
+
+    # Amendment A1.1: the sensitivity gate is defined on "the exact binary
+    # that replayed the corpus", so that binary's identity is recorded HERE,
+    # at run time, not reconstructed later from memory. sha256 of the file
+    # is the identity; the repo HEAD is a courtesy pointer and may be absent.
+    import hashlib
+    with open(moire, "rb") as fh:
+        moire_sha = hashlib.sha256(fh.read()).hexdigest()
+    head = None
+    try:
+        p_h = subprocess.Popen(
+            ["git", "-C", os.path.dirname(os.path.dirname(os.path.abspath(moire))),
+             "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out_h, _ = p_h.communicate(timeout=10)
+        if p_h.returncode == 0:
+            head = out_h.decode("ascii", "replace").strip()
+    except Exception:
+        pass
+    prov_path = out + ".manifest.json"
+    prov = {}
+    if os.path.exists(prov_path):
+        try:
+            with open(prov_path) as fh:
+                prov = json.load(fh)
+        except Exception:
+            prov = {}
+    binaries = prov.setdefault("moire_binaries", [])
+    entry = {"path": os.path.abspath(moire), "sha256": moire_sha, "repo_head": head}
+    if entry not in binaries:
+        binaries.append(entry)
+    with open(prov_path, "w") as fh:
+        json.dump(prov, fh, indent=1)
+    if len(binaries) > 1:
+        log("WARNING: this results file has now been written by %d distinct "
+            "moire binaries; the sensitivity gate is per-binary, so a mixed "
+            "run must pass it for EVERY one of them." % len(binaries))
+    log("moire binary sha256 %s%s" % (moire_sha[:16], (" (repo HEAD %s)" % head[:12]) if head else ""))
 
     n = 0
     bad_repos = {}
@@ -525,6 +592,24 @@ def cmd_run(args):
             log("[%d] %s #%s+#%s  head_unfetchable: %s" %
                 (n, p["repo"], p["a"], p["b"], (err_a or err_b)[:70]))
             continue
+
+        # Tier-2 eligibility, checked from the fetched heads BEFORE the
+        # replay. An external checker has no coverage channel, and a tree
+        # without the tool it invokes fails identically in self, peer and
+        # merged - the sentinel cancels in the subtraction and the pair
+        # would silently count as evaluated-clean, inflating the
+        # denominator with pairs on which nothing was measured. Same
+        # blindspot class the builtin checker's `performed` flag closed;
+        # this is the external-checker equivalent. Eligible = either head
+        # carries a tsconfig.json or declares typescript in (dev)deps.
+        if args.checker and (p.get("tier") == "typescript"):
+            if not (_ts_eligible(repo_dir, ref_a) or _ts_eligible(repo_dir, ref_b)):
+                rec["stage"] = "not_checker_eligible"
+                rec["error"] = "neither head carries tsconfig.json or a typescript dependency"
+                append_jsonl(out, rec)
+                log("[%d] %s #%s+#%s  not_checker_eligible (no typescript)" %
+                    (n, p["repo"], p["a"], p["b"]))
+                continue
 
         cmd = [sys.executable, moire, "replay", ref_a, ref_b, "--json"]
         if args.checker:
@@ -601,6 +686,57 @@ def classify_stage(record):
 
 # -------------------------------------------------------------------- report
 
+def _log_binom_cdf(k, n, p):
+    """log-space P(X <= k) for X ~ Binomial(n, p); exact via lgamma terms."""
+    if p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return 0.0 if k >= n else float("-inf")
+    from math import lgamma, log, exp
+    total = 0.0
+    for i in range(0, k + 1):
+        lg = (lgamma(n + 1) - lgamma(i + 1) - lgamma(n - i + 1)
+              + i * log(p) + (n - i) * log(1.0 - p))
+        total += exp(lg)
+    return min(total, 1.0)
+
+
+def clopper_pearson(k, n, alpha=0.05):
+    """Exact (Clopper-Pearson) two-sided interval for k successes in n trials.
+
+    Bisection on the exact binomial CDF - no scipy, per the harness's
+    stdlib-only rule. Good to ~1e-6, which is far inside what n<=1000 can
+    resolve anyway.
+    """
+    if n == 0:
+        return (0.0, 1.0)
+    if k == 0:
+        lo = 0.0
+    else:
+        f = lambda p: 1.0 - _log_binom_cdf(k - 1, n, p)   # P(X >= k)
+        a, b = 0.0, k / float(n)
+        for _ in range(50):
+            m = (a + b) / 2.0
+            if f(m) < alpha / 2.0:
+                a = m
+            else:
+                b = m
+        lo = (a + b) / 2.0
+    if k == n:
+        hi = 1.0
+    else:
+        g = lambda p: _log_binom_cdf(k, n, p)              # P(X <= k)
+        a, b = k / float(n), 1.0
+        for _ in range(50):
+            m = (a + b) / 2.0
+            if g(m) < alpha / 2.0:
+                b = m
+            else:
+                a = m
+        hi = (a + b) / 2.0
+    return (lo, hi)
+
+
 def cmd_report(args):
     results = read_jsonl(os.path.join(args.cache, args.out))
     if not results:
@@ -659,6 +795,18 @@ def cmd_report(args):
 
     clean_evaluated = stages["evaluated"]
 
+    # Amendment A1.2: per-tier rates are primary; the pooled rate decides
+    # nothing. Tally evaluated pairs and hits per tier here so the report
+    # can print each tier with its own exact interval.
+    by_tier = {}
+    for r in results:
+        if (r.get("stage") or "") != "evaluated":
+            continue
+        t = r.get("tier") or "unknown"
+        ev, h = by_tier.get(t, (0, 0))
+        sem_r = (r.get("replay") or {}).get("semantic") or {}
+        by_tier[t] = (ev + 1, h + (1 if (sem_r.get("new_breakage") or []) else 0))
+
     lines = []
     lines.append("ATTRITION  (every drop counted; PHASE1-PREREGISTRATION.md)")
     lines.append("")
@@ -710,6 +858,11 @@ def cmd_report(args):
     if not args.calibration_passed:
         reasons.append("calibration not affirmed (pass --calibration-passed once the "
                        "comparison above has been reviewed)")
+    if not args.sensitivity_passed:
+        reasons.append("sensitivity not affirmed (amendment A1.1: run "
+                       "MOIRE_BIN=<the recorded binary> bash tests/benchmark_recall.sh, "
+                       "and pass --sensitivity-passed only if it exits 0 at its floor; "
+                       "the binary's sha256 is in the results manifest)")
     if not args.audited:
         reasons.append("audit not affirmed (every hit must be classified by hand; "
                        "pass --audited once the audit table is filled in)")
@@ -725,13 +878,33 @@ def cmd_report(args):
         lines.append("  breakage, checker artifacts and environment artifacts, and")
         lines.append("  only the true-collision count feeds the decision rule.")
     else:
+        for t in sorted(by_tier):
+            ev, h = by_tier[t]
+            lo, hi = clopper_pearson(h, ev)
+            lines.append("  tier %-11s %d of %d evaluated pairs reported breakage "
+                         "(%.2f%%, 95%% CI %.2f%%-%.2f%%)"
+                         % (t, h, ev, (100.0 * h / ev if ev else 0.0),
+                            100.0 * lo, 100.0 * hi))
         rate = 100.0 * len(hits) / clean_evaluated if clean_evaluated else 0.0
-        lines.append("  %d of %d evaluated pairs reported breakage (%.2f%%)."
+        lines.append("  pooled          %d of %d (%.2f%%) - reported for "
+                     "completeness; it decides nothing (amendment A1.2)"
                      % (len(hits), clean_evaluated, rate))
-        lines.append("  This is the REPORTED rate. The decision rule in")
+        lines.append("  These are REPORTED rates. The decision rule in")
         lines.append("  PHASE1-PREREGISTRATION.md is defined on the AUDITED")
-        lines.append("  true-collision rate; take it from the audit column.")
+        lines.append("  true-collision rate per tier; take it from the audit column.")
     lines.append("")
+    prov_path = os.path.join(args.cache, args.out + ".manifest.json")
+    if os.path.exists(prov_path):
+        try:
+            with open(prov_path) as fh:
+                _prov = json.load(fh)
+            for b in _prov.get("moire_binaries") or []:
+                lines.append("  replayed by moire sha256 %s%s" %
+                             (b.get("sha256", "?")[:16],
+                              (" (repo HEAD %s)" % b["repo_head"][:12]) if b.get("repo_head") else ""))
+            lines.append("")
+        except Exception:
+            pass
 
     lines.append("AUDIT TABLE  (%d hit(s))" % len(hits))
     lines.append("")
@@ -840,6 +1013,10 @@ def main(argv):
     p.add_argument("--json", action="store_true")
     p.add_argument("--calibration-passed", action="store_true",
                    help="affirm that the calibration comparison was reviewed and passed")
+    p.add_argument("--sensitivity-passed", action="store_true",
+                   help="affirm that tests/benchmark_recall.sh passed at its floor "
+                        "with MOIRE_BIN pointing at the exact binary that replayed "
+                        "the corpus (PHASE1-PREREGISTRATION.md, amendment A1.1)")
     p.add_argument("--audited", action="store_true",
                    help="affirm that every hit in the audit table has been classified")
     p.set_defaults(func=cmd_report)

@@ -73,12 +73,23 @@ python3 replay_corpus.py run --limit 50               # replay, resumable
 python3 replay_corpus.py report
 ```
 
+`run` records the sha256 of the exact `bin/moire` it replayed with, in a
+manifest beside the results file, because amendment A1.1 of the
+pre-registration defines its sensitivity gate on *that binary*: before any
+semantic number is read, `tests/benchmark_recall.sh` must pass at its floor
+with `MOIRE_BIN` pointing at it. `report` echoes the recorded hash, requires
+`--sensitivity-passed` alongside the existing `--calibration-passed` and
+`--audited` affirmations, and — per amendment A1.2 — prints the semantic rate
+**per tier** with an exact Clopper–Pearson 95% interval, with the pooled rate
+shown for completeness and deciding nothing.
+
 Tier 2 replaces the checker:
 
 ```bash
 python3 replay_corpus.py pairs --tier typescript --sample 100 --out ts-pairs.jsonl
 python3 replay_corpus.py run --pairs ts-pairs.jsonl --out ts-results.jsonl \
-    --checker 'npm ci --silent >/dev/null 2>&1 && npx tsc --noEmit | sed -E "s/\([0-9]+,[0-9]+\)//"'
+    --replay-timeout 1800 \
+    --checker 'npm ci --ignore-scripts --no-audit --no-fund >/dev/null 2>&1 && ./node_modules/.bin/tsc --noEmit | sed -E "s/\([0-9]+,[0-9]+\)//"'
 ```
 
 The install is **inside the checker command** on purpose. `moire replay` runs
@@ -93,6 +104,26 @@ Positions are stripped from `tsc` output because the finding text is the
 identity: the same error at a shifted line number must cancel in the
 subtraction, or every insertion above a pre-existing error would read as new
 breakage.
+
+Three details of that command are load-bearing, not style. `--ignore-scripts`,
+because this replays the lockfiles of hundreds of repositories nobody here has
+read, and an install that cannot run lifecycle scripts cannot run their code.
+`./node_modules/.bin/tsc` rather than `npx tsc`, per moire's own checker
+contract: `npx` does project discovery and will fetch a missing `typescript`
+from the network mid-measurement, which is nondeterminism by design. And no
+sentinel is needed for a failed install: a checker that exits nonzero with no
+output already becomes a fixed sentinel finding inside moire, so an install
+that fails in all three trees cancels in the subtraction, and one that fails
+only in the merged tree survives it — which is exactly the pre-registration's
+"dependency-level new breakage in its own category", and the audit classifies
+it there.
+
+A pair on which `tsc` could not run at all must not count as evaluated-clean,
+so `run` prechecks tier-2 eligibility from the fetched heads before replaying:
+a pair is eligible when either head carries a root `tsconfig.json` or declares
+`typescript` in its dependencies. Ineligible pairs stop on the
+`not_checker_eligible` rung — the external-checker equivalent of the builtin
+checker's `performed: false`.
 
 Once `cache/` is populated the only network the harness needs is git itself,
 so the fetch stages can be run somewhere with access and the cache carried to
