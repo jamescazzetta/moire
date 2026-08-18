@@ -95,3 +95,80 @@ or a tier is dropped because it came out inconvenient, and everything downstream
 one small step at a time.
 
 The rule above is fixed. The data decides.
+
+---
+
+## Amendment 1 — 18 August 2026, before any Phase 1 data
+
+**Standing.** The rule above says a change after the first replay run voids what
+follows. No Phase 1 replay has run: `research/phase1-results/` is empty, and the
+only replays to date are the 24-pair feasibility pilot of 12 August 2026 (20
+evaluated, declared uninformative at that n in `tools/replay-corpus/README.md`).
+"First replay run" is defined, from here on, as the first replay of the Phase 1
+corpus itself — the pilots were feasibility checks of the harness, not data. This
+amendment rests on external evidence — published literature, not anything this
+project has measured — and it commits to being the last: any change to this file
+after the first Phase 1 replay run, including to this amendment, voids the
+registration.
+
+Three changes. None of them moves a threshold.
+
+### A1.1 — A sensitivity gate, symmetric with the calibration gate
+
+The original design controls false positives four ways and false negatives not at
+all: a near-zero result cannot distinguish "the phenomenon is rare" from "the
+instrument is blind". That is not hypothetical. Six days before this amendment the
+builtin checker scored 2 of 8 on collisions CPython confirms on the merged tree,
+and nothing in this study design would ever have caught it.
+
+Before any semantic number is read: `tests/benchmark_recall.sh` — which grades
+every fixture with the real interpreter and never consults moire's verdict — must
+pass at its recorded floor **using the exact binary that replayed the corpus**, and
+that binary's commit hash is recorded in the published results. Failure voids the
+run, exactly as calibration failure does. This gate can only ever void a run;
+nothing in it can rescue one.
+
+### A1.2 — Per-tier rates are primary; the pooled rate is reported, not decisive
+
+Pooling ≥500 Python pairs with ~100 TypeScript pairs lets the weakest checker
+outvote the strongest five to one, and forces the TypeScript tier to clear roughly
+4% before the pool clears 0.5%. The original text recognised the problem ("a zero
+in the Python tier alone does not trigger the kill") but left "at or near zero"
+undefined. Defined now:
+
+- The audited true-collision rate is computed and published **per tier**, each
+  with a Clopper–Pearson 95% interval. The pooled rate is published for
+  completeness and decides nothing.
+- The decision table applies per tier, and `verify`'s fate is the strongest band
+  any tier reaches: **headline** if any tier exceeds 2%; **opt-in, number
+  attached** if any tier lands in 0.5–2%; **retired** only if **every** tier is
+  below 0.5%. Every published claim carries its tier's scope.
+- Decisions follow the point estimates, exactly as the original table did. The
+  intervals are published to be read, not to move the rule: an underpowered tier
+  must not become an escape hatch, so a tier that reaches its pre-registered
+  minimum (500 Python, 100 TypeScript) is decided on its point estimate, with its
+  interval traveling alongside the claim.
+
+### A1.3 — The prior, stated next to the threshold it judges
+
+The 0.5% threshold is unchanged. What changes is that the reader gets the number
+the literature puts beside it (compiled with sources and verification status in
+`research/semantic-conflict-taxonomy.md` and `docs/MEASUREMENTS.md`):
+
+- **5.4%** of textually clean human Java merges failed compile or tests
+  (Schesch et al., ASE 2024; 6,045 merges, both parents green).
+- **0.11%** of merge scenarios carried a confirmed build conflict, and **65.7%**
+  of those instances are Unavailable Symbol — the one category an import resolver
+  can reach (da Silva, Borba & Pires, JSEP 2022; 57,065 scenarios).
+- Composed for the category the Python tier's checker can see: roughly
+  **0.07%–0.6%** — a range that spans the kill line.
+
+Stated plainly, ahead of the data: **a Python-tier result in the retire band is
+the expected outcome under this prior.** If it lands there, the rule executes
+anyway. The point of publishing the prior is that a retirement will then read as
+what it is — a rare phenomenon, as the literature predicted, measured by an
+instrument whose sensitivity was proven by gate A1.1 — rather than as a failed
+tool. The prior's caveats are real and travel with it: it composes Java corpora
+onto Python, human merges onto agent merges, and all-scenario denominators onto
+textually-clean-pair denominators. It is an order-of-magnitude prior, not a
+calibration.
